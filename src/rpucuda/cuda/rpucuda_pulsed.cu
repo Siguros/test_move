@@ -727,12 +727,18 @@ void RPUCudaPulsed<T>::forwardMatrixIterator(
   }
   
   // 1) Check if top-level is LRTT (direct case)
-  printf("[DEBUG] Checking for LRTT device: rpucuda_device_=%p\n", rpucuda_device_.get());
+  if (std::getenv("AIHWKIT_DEBUG_LRTT")) {
+    printf("[DEBUG] Checking for LRTT device: rpucuda_device_=%p\n", rpucuda_device_.get());
+  }
   auto *lrtt = dynamic_cast<LRTTTransferRPUDeviceCuda<T>*>(rpucuda_device_.get());
   if (lrtt) {
-    printf("[DEBUG] Found direct LRTT device!\n");
+    if (std::getenv("AIHWKIT_DEBUG_LRTT")) {
+      printf("[DEBUG] Found direct LRTT device!\n");
+    }
     if (lrtt->shouldUseAnalogInject()) {
-      printf("[DEBUG] LRTT shouldUseAnalogInject returned true\n");
+      if (std::getenv("AIHWKIT_DEBUG_LRTT")) {
+        printf("[DEBUG] LRTT shouldUseAnalogInject returned true\n");
+      }
       // Initialize IOM with input
       f_iom_->initWithInput(X_input, getMetaPar().f_io, this->getXSize(), m_batch, x_trans, 
                            this->getFwdAlpha(), is_test);

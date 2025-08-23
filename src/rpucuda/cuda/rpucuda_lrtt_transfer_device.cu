@@ -526,6 +526,8 @@ LRTTTransferRPUDeviceCuda<T>::LRTTTransferRPUDeviceCuda(
   // Initialize after devices are created
   initializeDevicePointers();
   
+  // Note: Learning rate validation is handled in pulsed update path
+  
   // Allocate temporary buffers for PWU inputs
   int d_size = this->d_size_;
   int x_size = this->x_size_;
@@ -1798,6 +1800,65 @@ void LRTTTransferRPUDeviceCuda<T>::doLoRAPulsedUpdate_(
         dev_d_pad_->getData(),  // D = padded D_A (rank rows)
         dev_w_b_, devB, up, lr, m_batch, /*x_trans=*/false, /*d_trans=*/false);
   }
+}
+
+// Serialization support
+template <typename T>
+void LRTTTransferRPUDeviceCuda<T>::dumpExtra(RPU::state_t &extra, const std::string prefix) {
+  // Call base class first
+  TransferRPUDeviceCuda<T>::dumpExtra(extra, prefix);
+  
+  // Create state for LRTT-specific data
+  RPU::state_t state;
+  
+  // Save LRTT-specific parameters
+  RPU::insert(state, "rank", rank_);
+  RPU::insert(state, "transfer_counter", transfer_counter_);
+  RPU::insert(state, "num_a_updates", num_a_updates_);
+  RPU::insert(state, "num_b_updates", num_b_updates_);
+  RPU::insert(state, "num_transfers", num_transfers_);
+  
+  // Save meta parameters that affect forward pass
+  const auto &par = getPar();
+  RPU::insert(state, "forward_inject", par.forward_inject);
+  RPU::insert(state, "lora_alpha", par.lora_alpha);
+  RPU::insert(state, "idx_fastA", par.idx_fastA);
+  RPU::insert(state, "idx_fastB", par.idx_fastB);
+  RPU::insert(state, "idx_visible", par.idx_visible);
+  RPU::insert(state, "rank_chunk", par.rank_chunk);
+  RPU::insert(state, "rank_offset", par.rank_offset);
+  
+  // Insert with prefix
+  RPU::insertWithPrefix(extra, state, prefix);
+}
+
+template <typename T>
+void LRTTTransferRPUDeviceCuda<T>::loadExtra(const RPU::state_t &extra, const std::string prefix, bool strict) {
+  // Call base class first
+  TransferRPUDeviceCuda<T>::loadExtra(extra, prefix, strict);
+  
+  // Extract state with prefix
+  auto state = RPU::selectWithPrefix(extra, prefix);
+  
+  // Load LRTT-specific parameters
+  RPU::load(state, "rank", rank_, strict);
+  RPU::load(state, "transfer_counter", transfer_counter_, strict);
+  RPU::load(state, "num_a_updates", num_a_updates_, strict);
+  RPU::load(state, "num_b_updates", num_b_updates_, strict);
+  RPU::load(state, "num_transfers", num_transfers_, strict);
+  
+  // Load meta parameters (non-strict for backward compatibility)
+  auto &par = getPar();
+  RPU::load(state, "forward_inject", par.forward_inject, false);
+  RPU::load(state, "lora_alpha", par.lora_alpha, false);
+  RPU::load(state, "idx_fastA", par.idx_fastA, false);
+  RPU::load(state, "idx_fastB", par.idx_fastB, false);
+  RPU::load(state, "idx_visible", par.idx_visible, false);
+  RPU::load(state, "rank_chunk", par.rank_chunk, false);
+  RPU::load(state, "rank_offset", par.rank_offset, false);
+  
+  // Re-initialize device pointers after load to ensure consistency
+  initializeDevicePointers();
 }
 
 template class LRTTTransferRPUDeviceCuda<float>;

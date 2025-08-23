@@ -437,16 +437,17 @@ def lrtt_inference(
     # Wrap in inference config
     io_params = IOParameters(is_perfect=perfect_forward) if perfect_forward else LRTTIOParameters()
     
-    return InferenceRPUConfig(
+    # Note: InferenceRPUConfig API changed - using UnitCellRPUConfig with transfer_every=0
+    return UnitCellRPUConfig(
         device=lrtt,
         forward=io_params,
-        noise_model=None  # No inference noise
+        # For inference, set transfer_every to 0 to disable updates
     )
 
 
 # ==================== Validation and Helper Functions ====================
 
-def validate_lrtt_config(config: Union[UnitCellRPUConfig, InferenceRPUConfig]) -> bool:
+def validate_lrtt_config(config: UnitCellRPUConfig) -> bool:
     """Validate an LR-TT configuration.
     
     Checks that:

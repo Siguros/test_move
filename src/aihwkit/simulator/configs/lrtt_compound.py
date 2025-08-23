@@ -63,6 +63,9 @@ class LRTTTransferCompound(TransferCompound):
     transfer_lr: float = 1.0
     """Learning rate for the transfer update (W_to += transfer_lr * A @ B)."""
     
+    transfer_every: int = 1
+    """Transfer frequency (0 for inference, >0 for training)."""
+    
     # Step 1: reset_policy and gamma removed - only reinit remains
     
     correct_gradient_magnitudes: bool = False
@@ -204,8 +207,7 @@ class LRTTTransferCompound(TransferCompound):
         
         # Transfer and update parameters
         lrtt_params.transfer_lr = self.transfer_lr
-        lrtt_params.reset_policy = self.reset_policy
-        lrtt_params.gamma = self.gamma
+        # Note: reset_policy and gamma were removed - only reinit_gain remains
         
         # Optional parameters
         if hasattr(lrtt_params, 'correct_gradient_magnitudes'):
@@ -244,11 +246,13 @@ class LRTTTransferCompound(TransferCompound):
         lrtt_params.n_reads_per_transfer = self.n_reads_per_transfer
         lrtt_params.with_reset_prob = self.with_reset_prob
         
-        # Initialize gamma_vec with visible=1.0 if empty
-        if not getattr(lrtt_params, "gamma_vec", None) or not lrtt_params.gamma_vec:
-            gamma_vec = [0.0, 0.0, 0.0]
-            gamma_vec[2] = 1.0  # visible device at index 2
-            lrtt_params.gamma_vec = gamma_vec
+        # Do not override LR-TT defaults from C++.
+        # C++ sets gamma_vec = [1, 1, 0] for [fastA, fastB, visible].
+        # Only set if truly needed and not already initialized
+        if hasattr(lrtt_params, "gamma_vec"):
+            if not lrtt_params.gamma_vec:
+                # Set proper LR-TT convention: A and B active, visible off
+                lrtt_params.gamma_vec = [1.0, 1.0, 0.0]
         
         return lrtt_params
     

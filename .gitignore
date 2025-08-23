@@ -171,3 +171,9 @@ cython_debug/
 *.png
 .mypy_cache/
 notebooks/img/
+examples/data/DATASET/
+*.tar.gz
+*.o
+*.a
+.ninja_deps
+*.ii

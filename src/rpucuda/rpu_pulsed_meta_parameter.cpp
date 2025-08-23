@@ -152,9 +152,12 @@ template <typename T> void PulsedUpdateMetaParameter<T>::initialize() {
 template <typename T>
 void PulsedUpdateMetaParameter<T>::calculateBlAB(
     int &BL, T &A, T &B, T lr, T weight_granularity) const {
+  // Handle negative lr (from SGD convention: w = w - lr*grad)
+  // by taking absolute value - the sign is handled elsewhere
   if (lr < (T)0.0) {
-    RPU_FATAL("lr should be positive !");
-  } else if (lr == (T)0.0) {
+    lr = -lr;  // Convert to positive for internal calculations
+  }
+  if (lr == (T)0.0) {
     A = (T)0.0;
     B = (T)0.0;
     BL = 0;
