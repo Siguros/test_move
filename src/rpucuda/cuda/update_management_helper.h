@@ -101,4 +101,15 @@ int debugKernelTranslateTransFormatToBatchOrder64Format(
     T *indata, int size, int m_batch, T scaleprob, int K);
 }
 
+// Note: Required template instantiations for swap_x_d iterator combinations  
+// are handled in update_management_helper.cu via RPU_UMH_ITER_TEMPLATE macro
+
+
+// Extern template declarations
+extern template class UpdateManagementHelper<float>;
+
+#ifdef RPU_USE_DOUBLE
+extern template class UpdateManagementHelper<double>;
+#endif
+
 } // namespace RPU

@@ -257,6 +257,7 @@ template <typename T> struct PulsedUpdateMetaParameter {
   bool sto_round = false;
   bool d_sparsity = false; // whether compute d sparsity
   T _d_sparsity = 0.0;     // hidden container
+  bool swap_x_d = false;   // NEW: when true, swap X and D roles during online updates
 
   T res = (T)0; // this is taken to be in the range 0..1 as positive and negative phases are done
                 // separately

@@ -12,6 +12,7 @@
 #include "rpu_dynamic_transfer_device.h"
 #include "rpu_expstep_device.h"
 #include "rpu_linearstep_device.h"
+#include "rpu_lrtt_transfer_device.h"
 #include "rpu_mixedprec_device.h"
 #include "rpu_mixedprec_device_base.h"
 #include "rpu_onesided_device.h"
@@ -46,6 +47,7 @@ template <typename T> void declare_rpu_devices(py::module &m, std::string type_n
   using BufferedTransferParam = RPU::BufferedTransferRPUDeviceMetaParameter<T>;
   using ChoppedTransferParam = RPU::ChoppedTransferRPUDeviceMetaParameter<T>;
   using DynamicTransferParam = RPU::DynamicTransferRPUDeviceMetaParameter<T>;
+  using LRTTTransferParam = RPU::LRTTTransferRPUDeviceMetaParameter<T>;
   using SoftBoundsReferenceParam = RPU::SoftBoundsReferenceRPUDeviceMetaParameter<T>;
 
   /*
@@ -405,6 +407,28 @@ template <typename T> void declare_rpu_devices(py::module &m, std::string type_n
     }
     T calcWeightGranularity() const override {
       PYBIND11_OVERLOAD(T, DynamicTransferParam, calcWeightGranularity, );
+    }
+  };
+
+  class PyLRTTTransferParam : public LRTTTransferParam {
+  public:
+    std::string getName() const override {
+      PYBIND11_OVERLOAD(std::string, LRTTTransferParam, getName, );
+    }
+    LRTTTransferParam *clone() const override {
+      PYBIND11_OVERLOAD(LRTTTransferParam *, LRTTTransferParam, clone, );
+    }
+    RPU::DeviceUpdateType implements() const override {
+      PYBIND11_OVERLOAD(RPU::DeviceUpdateType, LRTTTransferParam, implements, );
+    }
+    RPU::LRTTTransferRPUDevice<T> *
+    createDevice(int x_size, int d_size, RPU::RealWorldRNG<T> *rng) override {
+      PYBIND11_OVERLOAD(
+          RPU::LRTTTransferRPUDevice<T> *, LRTTTransferParam, createDevice, x_size, d_size,
+          rng);
+    }
+    T calcWeightGranularity() const override {
+      PYBIND11_OVERLOAD(T, LRTTTransferParam, calcWeightGranularity, );
     }
   };
 
@@ -917,6 +941,48 @@ template <typename T> void declare_rpu_devices(py::module &m, std::string type_n
           "experimental_correct_accumulation",
           &DynamicTransferParam::experimental_correct_accumulation)
       .def("__str__", [](DynamicTransferParam &self) {
+        std::stringstream ss;
+        self.printToStream(ss);
+        return ss.str();
+      });
+
+  py::class_<LRTTTransferParam, PyLRTTTransferParam, TransferParam>(
+      m, NAME("LRTTTransferResistiveDeviceParameter"))
+      .def(py::init<>())
+      .def_readwrite("rank", &LRTTTransferParam::rank)
+      .def_readwrite("rank_chunk", &LRTTTransferParam::rank_chunk)
+      .def_readwrite("rank_offset", &LRTTTransferParam::rank_offset)
+      .def_readwrite("idx_visible", &LRTTTransferParam::idx_visible)
+      .def_readwrite("idx_fastA", &LRTTTransferParam::idx_fastA)
+      .def_readwrite("idx_fastB", &LRTTTransferParam::idx_fastB)
+      // reset_policy removed in Step 1
+      // gamma removed in Step 1
+      .def_readwrite("desired_BL", &LRTTTransferParam::desired_BL)
+      .def_readwrite("swap_xd", &LRTTTransferParam::swap_xd)
+      .def_readwrite("correct_gradient_magnitudes", &LRTTTransferParam::correct_gradient_magnitudes)
+      .def_readwrite("use_bl_management", &LRTTTransferParam::use_bl_management)
+      .def_readwrite("reinit_gain", &LRTTTransferParam::reinit_gain)
+      // reinit_only_lr_subspace removed in Step 1
+      // reinit_randomize_A removed in Step 1
+      // reinit_zero_B removed in Step 1
+      .def_property("update_rule",
+                    [](const LRTTTransferParam &self) {
+                      return "LR_TT"; // Only LR_TT is supported
+                    },
+                    [](LRTTTransferParam &self, const std::string &value) {
+                      if (value == "LR_TT") {
+                        self.update_rule = RPU::LRUpdateRule::LR_TT;
+                      } else if (value == "TT_Pure") {
+                        // Handle backward compatibility: map TT_Pure to LR_TT with warning
+                        std::cerr << "Warning: TT_Pure is deprecated, using LR_TT instead" << std::endl;
+                        self.update_rule = RPU::LRUpdateRule::LR_TT;
+                      } else {
+                        throw std::invalid_argument("Invalid update_rule: must be 'LR_TT' (TT_Pure is deprecated)");
+                      }
+                    })
+      .def_readwrite("lora_alpha", &LRTTTransferParam::lora_alpha)
+      .def_readwrite("forward_inject", &LRTTTransferParam::forward_inject)
+      .def("__str__", [](LRTTTransferParam &self) {
         std::stringstream ss;
         self.printToStream(ss);
         return ss.str();

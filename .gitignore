@@ -164,3 +164,10 @@ cython_debug/
 \#*\#
 .\#*
 *~
+
+# Large files (>1MB) - exclude for GitHub push
+*.whl
+*.pack
+*.png
+.mypy_cache/
+notebooks/img/

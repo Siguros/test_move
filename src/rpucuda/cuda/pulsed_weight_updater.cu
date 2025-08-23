@@ -30,6 +30,8 @@ PulsedWeightUpdater<T>::PulsedWeightUpdater(CudaContextPtr c, int x_size, int d_
 
 {
   blm_ = RPU::make_unique<BitLineMaker<T>>(c, x_size, d_size);
+  // Enable raw input exposure for LRTT and other devices that need it
+  blm_->setExposeRawInputs(true);
 
   up_context_ = nullptr;
   is_async_update_ = false;
@@ -76,8 +78,8 @@ pwukpvec_t<T> PulsedWeightUpdater<T>::getValidUpdateKernels(
       pwukpvec_t<T> v2 =
           rpucuda_device->getUpdateKernels(m_batch, up.getNK32Default(), use_bo64, out_trans, up);
       for (int i = 0; i < v2.size(); i++) {
-        if (v2[i]->isValid()) {
-          v.push_back(v2[i]);
+        if (v2[i] && v2[i]->isValid()) {
+          v.push_back(std::move(v2[i]));
         }
       }
     }
@@ -339,8 +341,10 @@ void PulsedWeightUpdater<T>::update(
     const int m_batch,
     const bool x_trans,
     const bool d_trans) {
-  // FP update if no device is given
-  if (rpucuda_device_in != nullptr && rpucuda_device_in->hasDirectUpdate()) {
+  // Direct-update는 오직 PulseType::None일 때만 사용 (그 외는 펄스 경로)
+  if (rpucuda_device_in != nullptr &&
+      rpucuda_device_in->hasDirectUpdate() &&
+      up.pulse_type == PulseType::None) {
     doDirectUpdate(x_in, d_in, rpucuda_device_in, dev_weights, lr, up, m_batch, x_trans, d_trans);
     return;
   } else if (
@@ -442,9 +446,24 @@ template class PulsedWeightUpdater<float>;
 RPU_PWU_ITER_TEMPLATE(float, IndexReaderTransInputIterator<float>, const float *);
 RPU_PWU_ITER_TEMPLATE(float, IndexReaderInputIterator<float>, const float *);
 RPU_PWU_ITER_TEMPLATE(float, const float *, const float *);
+// NEW: non-const version needed
+RPU_PWU_ITER_TEMPLATE(float, float *, float *);
+// NEW: mixed const/non-const for certain update paths
+RPU_PWU_ITER_TEMPLATE(float, const float *, float *);
+RPU_PWU_ITER_TEMPLATE(float, float *, const float *);
 RPU_PWU_ITER_TEMPLATE(
     float, IndexReaderTransInputIterator<float>, PermuterTransInputIterator<float>);
 RPU_PWU_ITER_TEMPLATE(float, const float *, PermuterTransInputIterator<float>);
+// NEW (LR-TT): Additional iterator pairs for PWU paths
+RPU_PWU_ITER_TEMPLATE(float,
+    IndexReaderTransInputIterator<float>,
+    IndexReaderInputIterator<float>);
+RPU_PWU_ITER_TEMPLATE(float,
+    PermuterTransInputIterator<float>,
+    const float *);
+RPU_PWU_ITER_TEMPLATE(float,
+    PermuterTransInputIterator<float>,
+    IndexReaderInputIterator<float>);
 
 RPU_PWU_ITER_TEMPLATE(
     float, IndexReaderSliceInputIterator<TRANSFLOAT(true)>, SliceInputIterator<TRANSFLOAT(true)>);
@@ -468,9 +487,21 @@ template class PulsedWeightUpdater<double>;
 RPU_PWU_ITER_TEMPLATE(double, IndexReaderTransInputIterator<double>, const double *);
 RPU_PWU_ITER_TEMPLATE(double, IndexReaderInputIterator<double>, const double *);
 RPU_PWU_ITER_TEMPLATE(double, const double *, const double *);
+// NEW: non-const version needed
+RPU_PWU_ITER_TEMPLATE(double, double *, double *);
 RPU_PWU_ITER_TEMPLATE(
     double, IndexReaderTransInputIterator<double>, PermuterTransInputIterator<double>);
 RPU_PWU_ITER_TEMPLATE(double, const double *, PermuterTransInputIterator<double>);
+// NEW (LR-TT): Additional iterator pairs for PWU paths
+RPU_PWU_ITER_TEMPLATE(double,
+    IndexReaderTransInputIterator<double>,
+    IndexReaderInputIterator<double>);
+RPU_PWU_ITER_TEMPLATE(double,
+    PermuterTransInputIterator<double>,
+    const double *);
+RPU_PWU_ITER_TEMPLATE(double,
+    PermuterTransInputIterator<double>,
+    IndexReaderInputIterator<double>);
 
 RPU_PWU_ITER_TEMPLATE(
     double,
@@ -499,9 +530,21 @@ template class PulsedWeightUpdater<half_t>;
 RPU_PWU_ITER_TEMPLATE(half_t, IndexReaderTransInputIterator<half_t>, const half_t *);
 RPU_PWU_ITER_TEMPLATE(half_t, IndexReaderInputIterator<half_t>, const half_t *);
 RPU_PWU_ITER_TEMPLATE(half_t, const half_t *, const half_t *);
+// NEW: non-const version needed
+RPU_PWU_ITER_TEMPLATE(half_t, half_t *, half_t *);
 RPU_PWU_ITER_TEMPLATE(
     half_t, IndexReaderTransInputIterator<half_t>, PermuterTransInputIterator<half_t>);
 RPU_PWU_ITER_TEMPLATE(half_t, const half_t *, PermuterTransInputIterator<half_t>);
+// NEW (LR-TT): Additional iterator pairs for PWU paths
+RPU_PWU_ITER_TEMPLATE(half_t,
+    IndexReaderTransInputIterator<half_t>,
+    IndexReaderInputIterator<half_t>);
+RPU_PWU_ITER_TEMPLATE(half_t,
+    PermuterTransInputIterator<half_t>,
+    const half_t *);
+RPU_PWU_ITER_TEMPLATE(half_t,
+    PermuterTransInputIterator<half_t>,
+    IndexReaderInputIterator<half_t>);
 
 RPU_PWU_ITER_TEMPLATE(
     half_t, IndexReaderSliceInputIterator<TRANSHALF(true)>, SliceInputIterator<TRANSHALF(true)>);

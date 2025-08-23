@@ -12,6 +12,8 @@
 
 #include "rpucuda.h"
 #include "rpucuda_pulsed.h"
+#include "rpucuda_lrtt_transfer_device.h"
+#include "rpucuda_vector_device.h"
 #include <ATen/cuda/CUDAContext.h>
 
 #define CHECK_CUDA(x)                                                                              \
@@ -162,6 +164,8 @@ void declare_rpu_tiles_cuda(py::module &m, std::string type_name_add, bool add_u
              bool d_trans = false, bool is_test = false, bool non_blocking = false) {
             auto x_input = x_input_.contiguous();
             CHECK_TORCH_CUDA_INPUT(x_input);
+            if (x_input.device().index() != self.getGPUId())
+              throw std::runtime_error("x_input must be on CUDA device " + std::to_string(self.getGPUId()));
 
             if (x_input.dim() < 1) {
               throw std::runtime_error(
@@ -239,6 +243,8 @@ void declare_rpu_tiles_cuda(py::module &m, std::string type_name_add, bool add_u
              bool x_trans = false, bool non_blocking = false) {
             auto d_input = d_input_.contiguous();
             CHECK_TORCH_CUDA_INPUT(d_input);
+            if (d_input.device().index() != self.getGPUId())
+              throw std::runtime_error("d_input must be on CUDA device " + std::to_string(self.getGPUId()));
 
             if (d_input.dim() < 1) {
               throw std::runtime_error(
@@ -322,6 +328,9 @@ void declare_rpu_tiles_cuda(py::module &m, std::string type_name_add, bool add_u
 
             CHECK_TORCH_CUDA_INPUT(d_input);
             CHECK_TORCH_CUDA_INPUT(x_input);
+            if (x_input.device().index() != self.getGPUId() ||
+                d_input.device().index() != self.getGPUId())
+              throw std::runtime_error("x_input/d_input must be on CUDA device " + std::to_string(self.getGPUId()));
 
             if ((x_input.dim() < 1) || (d_input.dim() < 1)) {
               throw std::runtime_error(
@@ -370,8 +379,8 @@ void declare_rpu_tiles_cuda(py::module &m, std::string type_name_add, bool add_u
             }
             self.releaseExternalStream();
           },
-          py::arg("x_input"), py::arg("d_input"), py::arg("bias"), py::arg("d_trans") = false,
-          py::arg("x_trans") = false, py::arg("non_blocking") = false,
+          py::arg("x_input"), py::arg("d_input"), py::arg("bias") = false, 
+          py::arg("x_trans") = false, py::arg("d_trans") = false, py::arg("non_blocking") = false,
           R"pbdoc(
            Compute an n-rank update.
 
@@ -540,7 +549,315 @@ void declare_rpu_tiles_cuda(py::module &m, std::string type_name_add, bool add_u
       .def(
           "__deepcopy__", [](const ClassPulsed &self, py::dict) { return ClassPulsed(self); },
           py::arg("memo"))
-      .def("get_meta_parameters", &ClassPulsed::getMetaPar);
+      .def("get_meta_parameters", &ClassPulsed::getMetaPar)
+      .def(
+          "lrtt_compose_w_eff",
+          [](ClassPulsed &self, double alpha) {
+            // Direct top-level cast to LR-TT device
+            auto& dev = self.getRPUDeviceCuda();
+            auto* lrtt_dev = dynamic_cast<RPU::LRTTTransferRPUDeviceCuda<T_RPU>*>(
+                const_cast<RPU::AbstractRPUDeviceCuda<T_RPU>*>(&dev));
+            if (!lrtt_dev) {
+              throw std::runtime_error("lrtt_compose_w_eff requires an LR-TT tile (not found)");
+            }
+
+            const int d = self.getDSize();
+            const int x = self.getXSize();
+
+            // Column-major output buffer: shape [d, x], stride [1, d]
+            auto opts = torch::TensorOptions()
+                .dtype(c10::CppTypeToScalarType<T>::value)
+                .device(torch::kCUDA, self.getGPUId())
+                .requires_grad(false);
+            torch::Tensor w_eff = torch::empty_strided({d, x}, {1, d}, opts);
+
+            // Launch on the current PyTorch stream
+            self.finishUpdateCalculations();
+            std::lock_guard<std::mutex> lock(self.mutex_);
+            self.setExternalStream(at::cuda::getCurrentCUDAStream());
+            lrtt_dev->composeForwardInject(
+                static_cast<T_RPU>(alpha),
+                reinterpret_cast<T_RPU*>(w_eff.template data_ptr<T>()),
+                self.getStream());
+            self.finishAllCalculations();
+            self.releaseExternalStream();
+            return w_eff;
+          },
+          py::arg("alpha"),
+          R"pbdoc(
+           Compose effective weights W_eff = W_visible + alpha * (A_lr @ B_lr).
+
+           Only for LR-TT tiles. The returned CUDA tensor is **column-major**
+           with shape ``[d_size, x_size]`` and strides ``[1, d_size]``.
+           
+           Note: The effective scale used is alpha_in × lora_alpha from the device meta-parameters.
+
+           Args:
+               alpha: LoRA alpha scaling factor
+
+           Returns:
+               w_eff: Effective weights [d_size, x_size] in column-major layout
+           )pbdoc")
+      // LR-TT sub-tile getters
+      .def(
+          "lrtt_get_visible_weights",
+          [](ClassPulsed &self) {
+            auto* dev_base = const_cast<RPU::AbstractRPUDeviceCuda<T_RPU>*>(&self.getRPUDeviceCuda());
+            auto* lrtt_dev = dynamic_cast<RPU::LRTTTransferRPUDeviceCuda<T_RPU>*>(dev_base);
+            if (!lrtt_dev) {
+              throw std::runtime_error("lrtt_get_visible_weights requires an LR-TT tile");
+            }
+            
+            const int d = self.getDSize();
+            const int x = self.getXSize();
+            
+            auto opts = torch::TensorOptions()
+                .dtype(c10::CppTypeToScalarType<T>::value)
+                .device(torch::kCUDA, self.getGPUId())
+                .requires_grad(false);
+            torch::Tensor weights = torch::empty_strided({d, x}, {1, d}, opts);
+            
+            self.finishUpdateCalculations();
+            std::lock_guard<std::mutex> lock(self.mutex_);
+            self.setExternalStream(at::cuda::getCurrentCUDAStream());
+            lrtt_dev->copyVisibleWeightsTo(
+                reinterpret_cast<T_RPU*>(weights.template data_ptr<T>()),
+                self.getStream());
+            self.finishAllCalculations();
+            self.releaseExternalStream();
+            return weights;
+          },
+          R"pbdoc(
+           Get the visible weights sub-tile C from LR-TT device.
+           
+           Returns:
+               weights: Visible weights [d_size, x_size] in column-major layout
+           )pbdoc")
+      .def(
+          "lrtt_get_A_lr",
+          [](ClassPulsed &self) {
+            auto* dev_base = const_cast<RPU::AbstractRPUDeviceCuda<T_RPU>*>(&self.getRPUDeviceCuda());
+            auto* lrtt_dev = dynamic_cast<RPU::LRTTTransferRPUDeviceCuda<T_RPU>*>(dev_base);
+            if (!lrtt_dev) {
+              throw std::runtime_error("lrtt_get_A_lr requires an LR-TT tile");
+            }
+            
+            const int d = self.getDSize();
+            const int rank = lrtt_dev->getRank();
+            
+            auto opts = torch::TensorOptions()
+                .dtype(c10::CppTypeToScalarType<T>::value)
+                .device(torch::kCUDA, self.getGPUId())
+                .requires_grad(false);
+            torch::Tensor A_lr = torch::empty_strided({d, rank}, {1, d}, opts);
+            
+            self.finishUpdateCalculations();
+            std::lock_guard<std::mutex> lock(self.mutex_);
+            self.setExternalStream(at::cuda::getCurrentCUDAStream());
+            lrtt_dev->copyALRTo(
+                reinterpret_cast<T_RPU*>(A_lr.template data_ptr<T>()),
+                self.getStream());
+            self.finishAllCalculations();
+            self.releaseExternalStream();
+            return A_lr;
+          },
+          R"pbdoc(
+           Get the A low-rank matrix from LR-TT device.
+           
+           Returns:
+               A_lr: A matrix [d_size, rank] in column-major layout
+           )pbdoc")
+      .def(
+          "lrtt_get_B_lr",
+          [](ClassPulsed &self) {
+            auto* dev_base = const_cast<RPU::AbstractRPUDeviceCuda<T_RPU>*>(&self.getRPUDeviceCuda());
+            auto* lrtt_dev = dynamic_cast<RPU::LRTTTransferRPUDeviceCuda<T_RPU>*>(dev_base);
+            if (!lrtt_dev) {
+              throw std::runtime_error("lrtt_get_B_lr requires an LR-TT tile");
+            }
+            
+            const int x = self.getXSize();
+            const int rank = lrtt_dev->getRank();
+            
+            auto opts = torch::TensorOptions()
+                .dtype(c10::CppTypeToScalarType<T>::value)
+                .device(torch::kCUDA, self.getGPUId())
+                .requires_grad(false);
+            torch::Tensor B_lr = torch::empty_strided({rank, x}, {1, rank}, opts);
+            
+            self.finishUpdateCalculations();
+            std::lock_guard<std::mutex> lock(self.mutex_);
+            self.setExternalStream(at::cuda::getCurrentCUDAStream());
+            lrtt_dev->copyBLRTo(
+                reinterpret_cast<T_RPU*>(B_lr.template data_ptr<T>()),
+                self.getStream());
+            self.finishAllCalculations();
+            self.releaseExternalStream();
+            return B_lr;
+          },
+          R"pbdoc(
+           Get the B low-rank matrix from LR-TT device.
+           
+           Returns:
+               B_lr: B matrix [rank, x_size] in column-major layout
+           )pbdoc")
+      // LR-TT sub-tile setters
+      .def(
+          "lrtt_set_visible_weights",
+          [](ClassPulsed &self, torch::Tensor weights) {
+            auto* dev_base = const_cast<RPU::AbstractRPUDeviceCuda<T_RPU>*>(&self.getRPUDeviceCuda());
+            auto* lrtt_dev = dynamic_cast<RPU::LRTTTransferRPUDeviceCuda<T_RPU>*>(dev_base);
+            if (!lrtt_dev) {
+              throw std::runtime_error("lrtt_set_visible_weights requires an LR-TT tile");
+            }
+            
+            const int d = self.getDSize();
+            const int x = self.getXSize();
+            
+            // Shape
+            if (weights.dim() != 2 || weights.size(0) != d || weights.size(1) != x) {
+              throw std::runtime_error("weights must have shape [d_size, x_size]");
+            }
+            // Device
+            if (!weights.is_cuda() || weights.device().index() != self.getGPUId()) {
+              throw std::runtime_error("weights must be a CUDA tensor on the same device as the tile");
+            }
+            // Dtype
+            if (weights.scalar_type() != c10::CppTypeToScalarType<T>::value) {
+              throw std::runtime_error("weights dtype must match tile dtype");
+            }
+            
+            // Ensure column-major [d, x], strides [1, d]
+            const bool is_col_major = (weights.stride(0) == 1 && weights.stride(1) == d);
+            auto opts = weights.options().device(torch::kCUDA, self.getGPUId()).requires_grad(false);
+            torch::Tensor cm = is_col_major ? weights
+                                            : torch::empty_strided({d, x}, {1, d}, opts);
+            if (!is_col_major) {
+              cm.copy_(weights);
+            }
+            
+            self.finishUpdateCalculations();
+            std::lock_guard<std::mutex> lock(self.mutex_);
+            self.setExternalStream(at::cuda::getCurrentCUDAStream());
+            lrtt_dev->copyVisibleWeightsFrom(
+                reinterpret_cast<const T_RPU*>(cm.template data_ptr<T>()),
+                self.getStream());
+            self.finishAllCalculations();
+            self.releaseExternalStream();
+          },
+          py::arg("weights"),
+          R"pbdoc(
+           Set the visible weights sub-tile C in LR-TT device.
+           
+           Args:
+               weights: [d_size, x_size] CUDA tensor on the same device as the tile.
+                        Preferred layout: column-major (strides [1, d_size]).
+                        Row-major inputs are accepted and internally converted.
+           )pbdoc")
+      .def(
+          "lrtt_set_A_lr",
+          [](ClassPulsed &self, torch::Tensor A_lr) {
+            auto* dev_base = const_cast<RPU::AbstractRPUDeviceCuda<T_RPU>*>(&self.getRPUDeviceCuda());
+            auto* lrtt_dev = dynamic_cast<RPU::LRTTTransferRPUDeviceCuda<T_RPU>*>(dev_base);
+            if (!lrtt_dev) {
+              throw std::runtime_error("lrtt_set_A_lr requires an LR-TT tile");
+            }
+            
+            const int d = self.getDSize();
+            const int rank = lrtt_dev->getRank();
+            
+            // Shape
+            if (A_lr.dim() != 2 || A_lr.size(0) != d || A_lr.size(1) != rank) {
+              throw std::runtime_error("A_lr must have shape [d_size, rank]");
+            }
+            // Device
+            if (!A_lr.is_cuda() || A_lr.device().index() != self.getGPUId()) {
+              throw std::runtime_error("A_lr must be a CUDA tensor on the same device as the tile");
+            }
+            // Dtype
+            if (A_lr.scalar_type() != c10::CppTypeToScalarType<T>::value) {
+              throw std::runtime_error("A_lr dtype must match tile dtype");
+            }
+            
+            // Ensure column-major [d, rank], strides [1, d]
+            const bool is_col_major = (A_lr.stride(0) == 1 && A_lr.stride(1) == d);
+            auto opts = A_lr.options().device(torch::kCUDA, self.getGPUId()).requires_grad(false);
+            torch::Tensor cm = is_col_major ? A_lr
+                                            : torch::empty_strided({d, rank}, {1, d}, opts);
+            if (!is_col_major) {
+              cm.copy_(A_lr);
+            }
+            
+            self.finishUpdateCalculations();
+            std::lock_guard<std::mutex> lock(self.mutex_);
+            self.setExternalStream(at::cuda::getCurrentCUDAStream());
+            lrtt_dev->copyALRFrom(
+                reinterpret_cast<const T_RPU*>(cm.template data_ptr<T>()),
+                self.getStream());
+            self.finishAllCalculations();
+            self.releaseExternalStream();
+          },
+          py::arg("A_lr"),
+          R"pbdoc(
+           Set the A low-rank matrix in LR-TT device.
+           
+           Args:
+               A_lr: [d_size, rank] CUDA tensor on the same device as the tile.
+                     Preferred layout: column-major (strides [1, d_size]).
+                     Row-major inputs are accepted and internally converted.
+           )pbdoc")
+      .def(
+          "lrtt_set_B_lr",
+          [](ClassPulsed &self, torch::Tensor B_lr) {
+            auto* dev_base = const_cast<RPU::AbstractRPUDeviceCuda<T_RPU>*>(&self.getRPUDeviceCuda());
+            auto* lrtt_dev = dynamic_cast<RPU::LRTTTransferRPUDeviceCuda<T_RPU>*>(dev_base);
+            if (!lrtt_dev) {
+              throw std::runtime_error("lrtt_set_B_lr requires an LR-TT tile");
+            }
+            
+            const int x = self.getXSize();
+            const int rank = lrtt_dev->getRank();
+            
+            // Shape
+            if (B_lr.dim() != 2 || B_lr.size(0) != rank || B_lr.size(1) != x) {
+              throw std::runtime_error("B_lr must have shape [rank, x_size]");
+            }
+            // Device
+            if (!B_lr.is_cuda() || B_lr.device().index() != self.getGPUId()) {
+              throw std::runtime_error("B_lr must be a CUDA tensor on the same device as the tile");
+            }
+            // Dtype
+            if (B_lr.scalar_type() != c10::CppTypeToScalarType<T>::value) {
+              throw std::runtime_error("B_lr dtype must match tile dtype");
+            }
+            
+            // Ensure column-major [rank, x], strides [1, rank]
+            const bool is_col_major = (B_lr.stride(0) == 1 && B_lr.stride(1) == rank);
+            auto opts = B_lr.options().device(torch::kCUDA, self.getGPUId()).requires_grad(false);
+            torch::Tensor cm = is_col_major ? B_lr
+                                            : torch::empty_strided({rank, x}, {1, rank}, opts);
+            if (!is_col_major) {
+              cm.copy_(B_lr);
+            }
+            
+            self.finishUpdateCalculations();
+            std::lock_guard<std::mutex> lock(self.mutex_);
+            self.setExternalStream(at::cuda::getCurrentCUDAStream());
+            lrtt_dev->copyBLRFrom(
+                reinterpret_cast<const T_RPU*>(cm.template data_ptr<T>()),
+                self.getStream());
+            self.finishAllCalculations();
+            self.releaseExternalStream();
+          },
+          py::arg("B_lr"),
+          R"pbdoc(
+           Set the B low-rank matrix in LR-TT device.
+           
+           Args:
+               B_lr: [rank, x_size] CUDA tensor on the same device as the tile.
+                     Preferred layout: column-major (strides [1, rank]).
+                     Row-major inputs are accepted and internally converted.
+           )pbdoc");
 };
 #undef NAME
 

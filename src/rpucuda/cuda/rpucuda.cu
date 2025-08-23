@@ -8,8 +8,14 @@
 #include "rpu.h"
 #include "rpucuda.h"
 #include "utility_functions.h"
+#include "rpucuda_lrtt_transfer_device.h"
+#include "rpucuda_vector_device.h"
+#include "rpucuda_pulsed.h"
+#include "rpucuda_simple_device.h"
+#include "io_manager.h"
 
 #include <iostream>
+#include <typeinfo>
 // #include <random>
 #include <chrono>
 #include <cmath>
@@ -579,6 +585,17 @@ template <typename T>
 void RPUCudaSimple<T>::forwardMatrix(
     const T *X_input, T *D_output, int m_batch, bool x_trans, bool d_trans, bool is_test) {
 
+  // --- Bridge to Pulsed so LR-TT hook can run ---
+  if (auto* pulsed = dynamic_cast<RPUCudaPulsed<T>*>(this)) {
+    if (std::getenv("AIHWKIT_DEBUG_LRTT")) {
+      std::cout << "[FORWARD DEBUG] RPUCudaSimple bridge -> RPUCudaPulsed::forwardMatrix" << std::endl;
+    }
+    pulsed->bridgeForwardMatrix(X_input, D_output, m_batch, x_trans, d_trans, is_test);
+    return;
+  }
+  // --- fall back to the default path below ---
+
+  // Default forward path
   RPU::detail::forwardMatrix(
       this->context_, getFBWeightsCuda(is_test), X_input, this->x_size_, x_trans, D_output,
       this->d_size_, d_trans, m_batch, this->getFwdAlpha());
@@ -632,6 +649,17 @@ void RPUCudaSimple<T>::updateMatrix(
 template <typename T>
 void RPUCudaSimple<T>::forwardVector(
     const T *x_input, T *d_output, int x_inc, int d_inc, bool is_test) {
+  
+  // --- Bridge to Pulsed so LR-TT hook can run ---
+  if (auto* pulsed = dynamic_cast<RPUCudaPulsed<T>*>(this)) {
+    if (std::getenv("AIHWKIT_DEBUG_LRTT")) {
+      std::cout << "[FORWARD DEBUG] RPUCudaSimple bridge -> RPUCudaPulsed::forwardVector" << std::endl;
+    }
+    pulsed->bridgeForwardVector(x_input, d_output, x_inc, d_inc, is_test);
+    return;
+  }
+  // --- fall back to the default path below ---
+  
   RPU::math::gemv<T>(
       context_, false, this->d_size_, this->x_size_, this->getFwdAlpha(), getFBWeightsCuda(is_test),
       this->d_size_, // because of *column* major format !

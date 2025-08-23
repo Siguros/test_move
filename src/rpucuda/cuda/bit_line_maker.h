@@ -91,6 +91,13 @@ public:
   inline T getCurrentLR() const { return current_lr_; };
   void initializeBLBuffers(int m_batch, int BL, int use_bo64, bool implicit_pulses);
 
+  // Enable/disable storing raw inputs every makeCounts() call
+  void setExposeRawInputs(bool v) { expose_raw_inputs_ = v; }
+
+  // Return raw inputs (may be null if expose_raw_inputs_ == false)
+  T* getRawXData() const { return dev_x_raw_ ? dev_x_raw_->getData() : nullptr; }
+  T* getRawDData() const { return dev_d_raw_ ? dev_d_raw_->getData() : nullptr; }
+
   // helper for debug
   void getCountsDebug(uint32_t *x_counts, uint32_t *d_counts);
   void getAccCountsDebug(
@@ -143,6 +150,11 @@ private:
   std::unique_ptr<CudaArray<uint64_t>> dev_d_counts_bo64_ = nullptr;
 
   std::unique_ptr<UpdateManagementHelper<T>> umh_ = nullptr;
+
+  // For exposing raw FP inputs regardless of BLM output format
+  bool expose_raw_inputs_ = false;
+  std::unique_ptr<CudaArray<T>> dev_x_raw_ = nullptr;
+  std::unique_ptr<CudaArray<T>> dev_d_raw_ = nullptr;
 };
 
 namespace test_helper {

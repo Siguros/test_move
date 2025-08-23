@@ -7,6 +7,7 @@
 #include "pwu_kernel_parameter.h"
 #include "rpu_pulsed_meta_parameter.h"
 #include "rpucuda_pulsed_device.h"
+#include <iostream>
 #include <memory>
 
 #include "rpucuda_buffered_transfer_device.h"
@@ -25,6 +26,8 @@
 #include "rpucuda_softbounds_reference_device.h"
 #include "rpucuda_transfer_device.h"
 #include "rpucuda_vector_device.h"
+#include "rpucuda_lrtt_transfer_device.h"
+#include "rpu_lrtt_transfer_device.h"
 
 namespace RPU {
 
@@ -53,6 +56,11 @@ AbstractRPUDeviceCuda<T>::createFrom(CudaContextPtr c, const AbstractRPUDevice<T
   case DeviceUpdateType::OneSided:
     return new OneSidedRPUDeviceCuda<T>(c, static_cast<const OneSidedRPUDevice<T> &>(rpu_device));
   case DeviceUpdateType::Transfer:
+    // Check if it's specifically an LRTT device
+    if (auto *lrtt_device = dynamic_cast<const LRTTTransferRPUDevice<T> *>(&rpu_device)) {
+      std::cout << "[DEBUG] Creating LRTTTransferRPUDeviceCuda for LR-TT device" << std::endl;
+      return new LRTTTransferRPUDeviceCuda<T>(c, *lrtt_device);
+    }
     return new TransferRPUDeviceCuda<T>(c, static_cast<const TransferRPUDevice<T> &>(rpu_device));
   case DeviceUpdateType::BufferedTransfer:
     return new BufferedTransferRPUDeviceCuda<T>(
@@ -163,10 +171,11 @@ SimpleRPUDeviceCuda<T> &SimpleRPUDeviceCuda<T>::operator=(SimpleRPUDeviceCuda<T>
   par_storage_ = std::move(other.par_storage_);
   wdrifter_cuda_ = std::move(other.wdrifter_cuda_);
 
-  dev_reset_nrnd_ = std::move(dev_reset_nrnd_);
-  dev_reset_flag_ = std::move(dev_reset_flag_);
-  rnd_context_ = std::move(rnd_context_);
-  dev_diffusion_nrnd_ = std::move(dev_diffusion_nrnd_);
+  // FIX: move from 'other', not from 'this'
+  dev_reset_nrnd_ = std::move(other.dev_reset_nrnd_);
+  dev_reset_flag_ = std::move(other.dev_reset_flag_);
+  rnd_context_ = std::move(other.rnd_context_);
+  dev_diffusion_nrnd_ = std::move(other.dev_diffusion_nrnd_);
 
   return *this;
 };

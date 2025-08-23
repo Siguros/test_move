@@ -7,6 +7,8 @@
 """Configurations presets for resistive processing units."""
 
 from .configs import (
+    # Low-Rank Transfer Tiki-Taka configs.
+    LRTTPreset,
     # Single device configs.
     ReRamESPreset,
     ReRamSBPreset,
@@ -83,3 +85,19 @@ from .devices import (
 )
 from .compounds import PCMPresetUnitCell
 from .utils import PresetIOParameters, StandardIOParameters, PresetUpdateParameters
+
+# Import LR-TT module functions
+from .lrtt import (
+    lrtt_config,
+    lrtt_idealized,
+    lrtt_ecram,
+    lrtt_ecram_mo,
+    lrtt_reram,
+    lrtt_capacitor,
+    lrtt_mixed_precision,
+    lrtt_lora_style,
+    lrtt_chunked,
+    lrtt_inference,
+    validate_lrtt_config,
+    extract_cuda_tile_from_layer,
+)

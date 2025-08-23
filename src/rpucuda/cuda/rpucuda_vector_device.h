@@ -88,6 +88,11 @@ public:
   std::vector<T> getReduceWeightening() const;
   std::vector<uint64_t> getPulseCounters() const override;
 
+  // Expose subdevices for traversal (read-only)
+  const std::vector<std::unique_ptr<PulsedRPUDeviceCudaBase<T>>> &getRPUDeviceVec() const {
+    return rpucuda_device_vec_;
+  }
+
 protected:
   virtual void reduceToWeights(CudaContextPtr c, T *dev_weights);
 

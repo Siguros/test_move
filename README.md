@@ -171,9 +171,13 @@ learning models at reduced energy consumption.
 
 ## Installation
 
-### Installing from PyPI
+### Installing the Custom LR-TT CUDA Build
 
-The preferred way to install this package is by using the
+This repository contains a custom CUDA-enabled build of AIHWKit with LR-TT (Low-Rank Tensor Train) support. For installation instructions for this specific build, see the [LR-TT Installation Guide](#lrtt-installation-guide) section below.
+
+### Installing from PyPI (Standard Version)
+
+The preferred way to install the standard package is by using the
 [Python package index]:
 
 ```shell
@@ -208,6 +212,115 @@ You can then run a GPU enabled docker container using the follwing command from 
 ```shell
 docker run --rm -it --gpus all -v $(pwd):$HOME --name aihwkit aihwkit:cuda bash
 ```
+
+## LR-TT Installation Guide
+
+This repository contains a custom CUDA-enabled build of AIHWKit with LR-TT (Low-Rank Tensor Train) support specifically built for CUDA 12.1 and Python 3.10.
+
+### Quick Install
+
+Download and install the wheel directly from the GitHub release:
+
+```bash
+# Download the wheel
+curl -L -o aihwkit-lrtt.whl https://github.com/Siguros/test_move/releases/download/v1.0.0-lrtt/aihwkit-0.9.0-cp310-cp310-linux_x86_64.whl
+
+# Install with no dependencies (recommended)
+pip install --no-deps ./aihwkit-lrtt.whl
+```
+
+### Install via Asset ID (for private repos)
+
+If you have a GitHub token with access to private repositories:
+
+```bash
+# Set your GitHub token
+export GITHUB_TOKEN="your_github_token_here"
+
+# Download via asset ID (avoids filename encoding issues)
+curl -L -H "Authorization: token ${GITHUB_TOKEN}" \
+     -H "Accept: application/octet-stream" \
+     "https://api.github.com/repos/Siguros/test_move/releases/assets/285490233" \
+     -o aihwkit-lrtt.whl
+
+# Install with no dependencies
+pip install --no-deps ./aihwkit-lrtt.whl
+```
+
+### Verification
+
+After installation, verify that CUDA support and LR-TT functionality work:
+
+```python
+import aihwkit
+from aihwkit.simulator.rpu_base import cuda
+import torch
+
+print("AIHWKit version:", aihwkit.__version__)
+print("CUDA compiled:", cuda.is_compiled())
+
+# Test LR-TT functionality
+from aihwkit.nn import AnalogLinear
+from aihwkit.simulator.presets.lrtt import lrtt_idealized
+
+# Create LR-TT configuration
+cfg = lrtt_idealized(rank=16)
+cfg.device.forward_inject = True
+cfg.device.lora_alpha = 8.0
+
+# Create analog layer
+layer = AnalogLinear(32, 16, bias=False, rpu_config=cfg)
+
+# Move to CUDA if available
+if torch.cuda.is_available():
+    layer = layer.cuda()
+    x = torch.randn(4, 32, device='cuda')
+    print("✓ Using CUDA device")
+else:
+    x = torch.randn(4, 32)
+    print("! Using CPU device")
+
+# Test forward and backward pass
+y = layer(x)
+loss = y.sum()
+loss.backward()
+
+print("✓ LR-TT forward/backward pass successful")
+print("Output shape:", y.shape)
+```
+
+### Requirements for LR-TT Build
+
+- **Python**: 3.10
+- **CUDA**: 12.1 (cu121)
+- **PyTorch**: Compatible with CUDA 12.1
+- **Platform**: Linux x86_64
+
+### Build Information
+
+This wheel was built with:
+- **CUDA Support**: Enabled (CUDA 12.1)
+- **LR-TT Support**: Enabled
+- **Platform**: linux_x86_64
+- **Python**: 3.10
+
+### Troubleshooting LR-TT Build
+
+If `cuda.is_compiled()` returns `False`:
+
+1. Ensure you have CUDA 12.1 installed
+2. Verify PyTorch was installed with CUDA support:
+   ```python
+   import torch
+   print("PyTorch CUDA available:", torch.cuda.is_available())
+   print("PyTorch CUDA version:", torch.version.cuda)
+   ```
+3. Check that you're using Python 3.10
+
+For installation issues:
+1. Use `--no-deps` flag to avoid dependency conflicts
+2. Ensure wheel compatibility (Python 3.10, Linux x86_64)
+3. Verify CUDA 12.1 is properly installed
 
 ## Authors
 

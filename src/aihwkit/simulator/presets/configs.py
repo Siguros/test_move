@@ -9,12 +9,14 @@
 """RPU configurations presets for resistive processing units."""
 
 from dataclasses import dataclass, field
+from typing import Optional
 
 from aihwkit.simulator.configs.configs import (
     SingleRPUConfig,
     UnitCellRPUConfig,
     DigitalRankUpdateRPUConfig,
 )
+from aihwkit.simulator.configs import MappingParameter
 from aihwkit.simulator.configs.devices import PulsedDevice
 from aihwkit.simulator.configs.compounds import (
     TransferCompound,
@@ -43,6 +45,98 @@ from aihwkit.simulator.presets.devices import (
 )
 from aihwkit.simulator.presets.compounds import PCMPresetUnitCell
 from aihwkit.simulator.presets.utils import PresetIOParameters, PresetUpdateParameters
+
+
+# Low-Rank Transfer Tiki-Taka configs.
+
+
+@dataclass
+class LRTTPreset(UnitCellRPUConfig):
+    """Low-Rank Transfer Tiki-Taka preset using existing TransferCompound tiles.
+
+    - Keeps TransferCompound/backends unchanged
+    - Disables backend one-hot transfer (transfer_every=0.0)
+    - Exposes Python-side LR-TT knobs: rank, py_transfer_every, py_transfer_lr, columns
+    - NEW: fast_device_type (aux/hidden) and slow_device_type (main/visible)
+    """
+
+    def __init__(
+        self,
+        *,
+        rank: int = 8,
+        transfer_every: int = 32,          # Python-side cadence
+        transfer_lr: float = 1.0,          # Python-side LR
+        units_in_mbatch: bool = True,      # parity only
+        transfer_columns: bool = True,     # stored for hook
+        gamma: float = 0.0,                # parity only (backend off)
+        # --- NEW ---
+        fast_device_type: Optional[str] = None,
+        slow_device_type: Optional[str] = None,
+        # Back-compat: if device_type is given, use it for BOTH fast & slow
+        device_type: Optional[str] = None,
+        mapping: Optional[MappingParameter] = None,
+        **kwargs,
+    ):
+        # store Python-side knobs
+        self.rank = rank
+        self.py_transfer_every = transfer_every
+        self.py_transfer_lr = transfer_lr
+        self.transfer_columns = transfer_columns
+
+        device_map = {
+            "ecram": EcRamPresetDevice,
+            "idealized": IdealizedPresetDevice,
+            "capacitor": CapacitorPresetDevice,
+            "reram_es": ReRamESPresetDevice,
+            "reram_sb": ReRamSBPresetDevice,
+        }
+
+        # resolve types with backward compatibility
+        if device_type is not None:
+            fast_device_type = fast_device_type or device_type
+            slow_device_type = slow_device_type or device_type
+        # defaults if still None
+        fast_device_type = fast_device_type or "ecram"
+        slow_device_type = slow_device_type or "ecram"
+
+        if fast_device_type not in device_map or slow_device_type not in device_map:
+            raise ValueError(
+                f"Unknown fast/slow device_type: "
+                f"{fast_device_type}, {slow_device_type}. "
+                f"Choose from {list(device_map.keys())}"
+            )
+
+        fast_dev_cls = device_map[fast_device_type]
+        slow_dev_cls = device_map[slow_device_type]
+
+        compound_device = TransferCompound(
+            # IMPORTANT: first = FAST (aux/hidden), second = SLOW (main/visible)
+            unit_cell_devices=[fast_dev_cls(), slow_dev_cls()],
+            transfer_forward=PresetIOParameters(
+                noise_management=NoiseManagementType.NONE,
+                bound_management=BoundManagementType.NONE,
+            ),
+            transfer_update=PresetUpdateParameters(),
+            units_in_mbatch=units_in_mbatch,
+
+            # hard-disable backend one-hot transfer
+            transfer_every=0.0,
+
+            # kept for API parity (no effect while backend transfer is disabled)
+            transfer_lr=transfer_lr,
+            gamma=gamma,
+            n_reads_per_transfer=1,
+            transfer_columns=transfer_columns,
+        )
+
+        super().__init__(
+            device=compound_device,
+            mapping=mapping or MappingParameter(),
+            forward=PresetIOParameters(),
+            backward=PresetIOParameters(),
+            update=PresetUpdateParameters(),
+            **kwargs,
+        )
 
 
 # Single device configs.

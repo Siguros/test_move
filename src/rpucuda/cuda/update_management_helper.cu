@@ -6,6 +6,7 @@
 
 #include "bit_line_maker.h"
 #include "update_management_helper.h"
+#include "io_iterator.h"
 
 #include <cmath>
 #include <iostream>
@@ -14,7 +15,6 @@
 #include "cuda_fp16_util.h"
 #include "cuda_math_util.h"
 #include "cuda_util.h"
-#include "io_iterator.h"
 #include "rpu_cub.h"
 
 namespace RPU {
@@ -152,7 +152,7 @@ __global__ void kernelTranslateTransFormatToBatchOrder64Format(
     int total_nB = 0;
     uint32_t last_neg = 0;
     uint32_t last_c = 0;
-    int current_nB = 0;
+    int writer_lane_idx = 0;
     kagg_t Kc_aggregate = 0;
     int K_left_over = 0;
     // loop over batch
@@ -163,7 +163,7 @@ __global__ void kernelTranslateTransFormatToBatchOrder64Format(
         neg_shared[threadIdx.x] = 0;
       }
 
-      if (threadIdx.x == current_nB) { // to avoid a sync, see below
+      if (threadIdx.x == writer_lane_idx) { // to avoid a sync, see below
         c_shared[0] = last_c;
         neg_shared[0] = last_neg;
       }
@@ -228,6 +228,7 @@ __global__ void kernelTranslateTransFormatToBatchOrder64Format(
         last_neg = neg_shared[current_nB];
         last_c = c_shared[current_nB];
       }
+      writer_lane_idx = current_nB;  // Update writer_lane_idx for next iteration
       total_nB += current_nB;
     }
   }
@@ -567,6 +568,7 @@ kagg_t UpdateManagementHelper<T>::getKnValue(bool ublm, int m_batch, int K) cons
   kagg_t *kndata = getKnData(ublm, m_batch);
   if (kndata != nullptr) {
     tmp.assignFromDevice(kndata);
+    context_->synchronize();
     tmp.copyTo(&Kn);
   }
   return Kn;
@@ -593,6 +595,7 @@ void UpdateManagementHelper<T>::getAverageAbsMax(T &m_x, T &m_d, int m_batch) co
           (void *)dev_sumabsmax_temp_storage_->getData(), ssz, d_maximizer_->getMaxValues(),
           dev_sumabsmax_value_->getData() + 1, m_batch, context_->getStream()));
   T result[2];
+  context_->synchronize();
   dev_sumabsmax_value_->copyTo(result);
   m_x = result[0] / (T)m_batch;
   m_d = result[1] / (T)m_batch;
@@ -622,9 +625,10 @@ void UpdateManagementHelper<T>::getAverageLogAbsMax(T &m_x, T &m_d, int m_batch)
           (void *)dev_sumabsmax_temp_storage_->getData(), ssz, d_input_iter,
           dev_sumabsmax_value_->getData() + 1, m_batch, context_->getStream()));
   T result[2];
+  context_->synchronize();
   dev_sumabsmax_value_->copyTo(result);
-  m_x = expf(result[0] / (T)m_batch);
-  m_d = expf(result[1] / (T)m_batch);
+  m_x = static_cast<T>(std::exp(static_cast<double>(result[0]) / static_cast<double>(m_batch)));
+  m_d = static_cast<T>(std::exp(static_cast<double>(result[1]) / static_cast<double>(m_batch)));
 }
 
 template <typename T> void UpdateManagementHelper<T>::getAbsMax(T &m_x, T &m_d, int m_batch) const {
@@ -647,6 +651,7 @@ template <typename T> void UpdateManagementHelper<T>::getAbsMax(T &m_x, T &m_d, 
           (void *)dev_sumabsmax_temp_storage_->getData(), ssz, d_maximizer_->getMaxValues(),
           dev_sumabsmax_value_->getData() + 1, m_batch, context_->getStream()));
   T result[2];
+  context_->synchronize();
   dev_sumabsmax_value_->copyTo(&result[0]);
   m_x = result[0];
   m_d = result[1];
@@ -741,20 +746,49 @@ template class UpdateManagementHelper<float>;
 
 RPU_UMH_ITER_TEMPLATE(float, const float *, const float *);
 RPU_UMH_ITER_TEMPLATE(float, float *, float *);
+// Mixed const/non-const for certain paths
+RPU_UMH_ITER_TEMPLATE(float, const float *, float *);
+RPU_UMH_ITER_TEMPLATE(float, float *, const float *);
 RPU_UMH_ITER_TEMPLATE(float, IndexReaderInputIterator<float>, const float *);
+// NEW (LR-TT swap_x_d): reversed order needed at import time
+RPU_UMH_ITER_TEMPLATE(float, const float *, IndexReaderInputIterator<float>);
 RPU_UMH_ITER_TEMPLATE(float, IndexReaderTransInputIterator<float>, const float *);
+// NEW: reversed order for trans iterator
+RPU_UMH_ITER_TEMPLATE(float, const float *, IndexReaderTransInputIterator<float>);
 RPU_UMH_ITER_TEMPLATE(
     float, IndexReaderTransInputIterator<float>, PermuterTransInputIterator<float>);
+// NEW (LR-TT): reversed order for PermuterTrans and IndexReaderTrans
+RPU_UMH_ITER_TEMPLATE(
+    float, PermuterTransInputIterator<float>, IndexReaderTransInputIterator<float>);
 RPU_UMH_ITER_TEMPLATE(
     float, IndexReaderSliceInputIterator<TRANSFLOAT(true)>, SliceInputIterator<TRANSFLOAT(true)>);
 RPU_UMH_ITER_TEMPLATE(
     float, IndexReaderSliceInputIterator<TRANSFLOAT(false)>, SliceInputIterator<TRANSFLOAT(false)>);
+// NEW: reversed order for slice index readers
+RPU_UMH_ITER_TEMPLATE(
+    float, const float *, IndexReaderSliceInputIterator<TRANSFLOAT(true)>);
+RPU_UMH_ITER_TEMPLATE(
+    float, const float *, IndexReaderSliceInputIterator<TRANSFLOAT(false)>);
 
 RPU_UMH_ITER_TEMPLATE(float, const float *, PermuterTransInputIterator<float>);
+// NEW (LR-TT): reversed order
+RPU_UMH_ITER_TEMPLATE(float, PermuterTransInputIterator<float>, const float *);
+// NEW (LR-TT): Input ↔ PermuterTrans pairs
+RPU_UMH_ITER_TEMPLATE(float, IndexReaderInputIterator<float>, PermuterTransInputIterator<float>);
+RPU_UMH_ITER_TEMPLATE(float, PermuterTransInputIterator<float>, IndexReaderInputIterator<float>);
+// NEW (LR-TT): IndexReaderTrans ↔ IndexReader pairs  
+RPU_UMH_ITER_TEMPLATE(float, IndexReaderTransInputIterator<float>, IndexReaderInputIterator<float>);
+RPU_UMH_ITER_TEMPLATE(float, IndexReaderInputIterator<float>, IndexReaderTransInputIterator<float>);
 RPU_UMH_ITER_TEMPLATE(float, const float *, SliceInputIterator<TRANSFLOAT(true)>);
 RPU_UMH_ITER_TEMPLATE(float, const float *, SliceInputIterator<TRANSFLOAT(false)>);
+// NEW: Required for swap_x_d path (X = SliceInputIterator, D = const T*)
+RPU_UMH_ITER_TEMPLATE(float, SliceInputIterator<TRANSFLOAT(true)>, const float *);
+RPU_UMH_ITER_TEMPLATE(float, SliceInputIterator<TRANSFLOAT(false)>, const float *);
 RPU_UMH_ITER_TEMPLATE(float, IndexReaderSliceInputIterator<TRANSFLOAT(true)>, const float *);
 RPU_UMH_ITER_TEMPLATE(float, IndexReaderSliceInputIterator<TRANSFLOAT(false)>, const float *);
+// NEW (LR-TT): Slice ↔ IndexReaderSlice reversed pairs
+RPU_UMH_ITER_TEMPLATE(float, SliceInputIterator<TRANSFLOAT(true)>, IndexReaderSliceInputIterator<TRANSFLOAT(true)>);
+RPU_UMH_ITER_TEMPLATE(float, SliceInputIterator<TRANSFLOAT(false)>, IndexReaderSliceInputIterator<TRANSFLOAT(false)>);
 RPU_UMH_ITER_TEMPLATE(float, EyeInputIterator<float>, const float *);
 RPU_UMH_ITER_TEMPLATE(float, const float *, EyeInputIterator<float>);
 
@@ -769,8 +803,15 @@ RPU_UMH_ITER_TEMPLATE(double, const double *, const double *);
 RPU_UMH_ITER_TEMPLATE(double, double *, double *);
 RPU_UMH_ITER_TEMPLATE(
     double, IndexReaderTransInputIterator<double>, PermuterTransInputIterator<double>);
+// NEW (LR-TT): reversed order for PermuterTrans and IndexReaderTrans
+RPU_UMH_ITER_TEMPLATE(
+    double, PermuterTransInputIterator<double>, IndexReaderTransInputIterator<double>);
 RPU_UMH_ITER_TEMPLATE(double, IndexReaderInputIterator<double>, const double *);
+// NEW (LR-TT): reversed order
+RPU_UMH_ITER_TEMPLATE(double, const double *, IndexReaderInputIterator<double>);
 RPU_UMH_ITER_TEMPLATE(double, IndexReaderTransInputIterator<double>, const double *);
+// NEW: reversed order for trans iterator
+RPU_UMH_ITER_TEMPLATE(double, const double *, IndexReaderTransInputIterator<double>);
 RPU_UMH_ITER_TEMPLATE(
     double,
     IndexReaderSliceInputIterator<TRANSDOUBLE(true)>,
@@ -779,12 +820,31 @@ RPU_UMH_ITER_TEMPLATE(
     double,
     IndexReaderSliceInputIterator<TRANSDOUBLE(false)>,
     SliceInputIterator<TRANSDOUBLE(false)>);
+// NEW: reversed order for slice index readers
+RPU_UMH_ITER_TEMPLATE(
+    double, const double *, IndexReaderSliceInputIterator<TRANSDOUBLE(true)>);
+RPU_UMH_ITER_TEMPLATE(
+    double, const double *, IndexReaderSliceInputIterator<TRANSDOUBLE(false)>);
 
 RPU_UMH_ITER_TEMPLATE(double, const double *, PermuterTransInputIterator<double>);
+// NEW (LR-TT): reversed order
+RPU_UMH_ITER_TEMPLATE(double, PermuterTransInputIterator<double>, const double *);
+// NEW (LR-TT): Input ↔ PermuterTrans pairs
+RPU_UMH_ITER_TEMPLATE(double, IndexReaderInputIterator<double>, PermuterTransInputIterator<double>);
+RPU_UMH_ITER_TEMPLATE(double, PermuterTransInputIterator<double>, IndexReaderInputIterator<double>);
+// NEW (LR-TT): IndexReaderTrans ↔ IndexReader pairs
+RPU_UMH_ITER_TEMPLATE(double, IndexReaderTransInputIterator<double>, IndexReaderInputIterator<double>);
+RPU_UMH_ITER_TEMPLATE(double, IndexReaderInputIterator<double>, IndexReaderTransInputIterator<double>);
 RPU_UMH_ITER_TEMPLATE(double, const double *, SliceInputIterator<TRANSDOUBLE(true)>);
 RPU_UMH_ITER_TEMPLATE(double, const double *, SliceInputIterator<TRANSDOUBLE(false)>);
+// NEW: Required for swap_x_d path (X = SliceInputIterator, D = const T*)
+RPU_UMH_ITER_TEMPLATE(double, SliceInputIterator<TRANSDOUBLE(true)>, const double *);
+RPU_UMH_ITER_TEMPLATE(double, SliceInputIterator<TRANSDOUBLE(false)>, const double *);
 RPU_UMH_ITER_TEMPLATE(double, IndexReaderSliceInputIterator<TRANSDOUBLE(true)>, const double *);
 RPU_UMH_ITER_TEMPLATE(double, IndexReaderSliceInputIterator<TRANSDOUBLE(false)>, const double *);
+// NEW (LR-TT): Slice ↔ IndexReaderSlice reversed pairs
+RPU_UMH_ITER_TEMPLATE(double, SliceInputIterator<TRANSDOUBLE(true)>, IndexReaderSliceInputIterator<TRANSDOUBLE(true)>);
+RPU_UMH_ITER_TEMPLATE(double, SliceInputIterator<TRANSDOUBLE(false)>, IndexReaderSliceInputIterator<TRANSDOUBLE(false)>);
 RPU_UMH_ITER_TEMPLATE(double, EyeInputIterator<double>, const double *);
 RPU_UMH_ITER_TEMPLATE(double, const double *, EyeInputIterator<double>);
 
@@ -800,18 +860,41 @@ RPU_UMH_ITER_TEMPLATE(half_t, const half_t *, const half_t *);
 RPU_UMH_ITER_TEMPLATE(half_t, half_t *, half_t *);
 RPU_UMH_ITER_TEMPLATE(
     half_t, IndexReaderTransInputIterator<half_t>, PermuterTransInputIterator<half_t>);
+// NEW (LR-TT): reversed order for PermuterTrans and IndexReaderTrans
+RPU_UMH_ITER_TEMPLATE(
+    half_t, PermuterTransInputIterator<half_t>, IndexReaderTransInputIterator<half_t>);
 RPU_UMH_ITER_TEMPLATE(half_t, IndexReaderInputIterator<half_t>, const half_t *);
+// NEW (LR-TT): reversed order
+RPU_UMH_ITER_TEMPLATE(half_t, const half_t *, IndexReaderInputIterator<half_t>);
 RPU_UMH_ITER_TEMPLATE(half_t, IndexReaderTransInputIterator<half_t>, const half_t *);
+// NEW: reversed order for trans iterator
+RPU_UMH_ITER_TEMPLATE(half_t, const half_t *, IndexReaderTransInputIterator<half_t>);
 RPU_UMH_ITER_TEMPLATE(
     half_t, IndexReaderSliceInputIterator<TRANSHALF(true)>, SliceInputIterator<TRANSHALF(true)>);
 RPU_UMH_ITER_TEMPLATE(
     half_t, IndexReaderSliceInputIterator<TRANSHALF(false)>, SliceInputIterator<TRANSHALF(false)>);
+// NEW: reversed order for slice index readers
+RPU_UMH_ITER_TEMPLATE(
+    half_t, const half_t *, IndexReaderSliceInputIterator<TRANSHALF(true)>);
+RPU_UMH_ITER_TEMPLATE(
+    half_t, const half_t *, IndexReaderSliceInputIterator<TRANSHALF(false)>);
 
 RPU_UMH_ITER_TEMPLATE(half_t, const half_t *, PermuterTransInputIterator<half_t>);
+// NEW (LR-TT): reversed order
+RPU_UMH_ITER_TEMPLATE(half_t, PermuterTransInputIterator<half_t>, const half_t *);
+// NEW (LR-TT): Input ↔ PermuterTrans pairs
+RPU_UMH_ITER_TEMPLATE(half_t, IndexReaderInputIterator<half_t>, PermuterTransInputIterator<half_t>);
+RPU_UMH_ITER_TEMPLATE(half_t, PermuterTransInputIterator<half_t>, IndexReaderInputIterator<half_t>);
+// NEW (LR-TT): IndexReaderTrans ↔ IndexReader pairs
+RPU_UMH_ITER_TEMPLATE(half_t, IndexReaderTransInputIterator<half_t>, IndexReaderInputIterator<half_t>);
+RPU_UMH_ITER_TEMPLATE(half_t, IndexReaderInputIterator<half_t>, IndexReaderTransInputIterator<half_t>);
 RPU_UMH_ITER_TEMPLATE(half_t, const half_t *, SliceInputIterator<TRANSHALF(true)>);
 RPU_UMH_ITER_TEMPLATE(half_t, const half_t *, SliceInputIterator<TRANSHALF(false)>);
 RPU_UMH_ITER_TEMPLATE(half_t, IndexReaderSliceInputIterator<TRANSHALF(true)>, const half_t *);
 RPU_UMH_ITER_TEMPLATE(half_t, IndexReaderSliceInputIterator<TRANSHALF(false)>, const half_t *);
+// NEW (LR-TT): Slice ↔ IndexReaderSlice reversed pairs
+RPU_UMH_ITER_TEMPLATE(half_t, SliceInputIterator<TRANSHALF(true)>, IndexReaderSliceInputIterator<TRANSHALF(true)>);
+RPU_UMH_ITER_TEMPLATE(half_t, SliceInputIterator<TRANSHALF(false)>, IndexReaderSliceInputIterator<TRANSHALF(false)>);
 RPU_UMH_ITER_TEMPLATE(half_t, EyeInputIterator<half_t>, const half_t *);
 RPU_UMH_ITER_TEMPLATE(half_t, const half_t *, EyeInputIterator<half_t>);
 
@@ -819,4 +902,13 @@ RPU_UMH_ITER_TEMPLATE(half_t, const half_t *, EyeInputIterator<half_t>);
 #endif
 
 #undef RPU_UMH_ITER_TEMPLATE
+
+// Note: The required instantiations for swap_x_d iterator combinations
+// (SliceInputIterator with const T*) are already handled above at:
+// - lines 754-755: (const float*, SliceInputIterator<true/false,float>)
+// - lines 756-757: (SliceInputIterator<true/false,float>, const float*)
+// - lines 784-785: (const double*, SliceInputIterator<true/false,double>)
+// - lines 786-787: (SliceInputIterator<true/false,double>, const double*)
+
 } // namespace RPU
+ 

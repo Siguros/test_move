@@ -243,6 +243,30 @@ public:
     b_iom.releaseBuffer();
   }
 
+public:
+  // Public getter for fb_pars (needed for LR-TT analog inject)
+  const FBParameterCuda<T> &getFBPars() const { return fb_pars_; }
+  
+  // Public wrappers for LR-TT analog inject support
+  void computeAnalogMVSinglePassPublic(
+      T *dev_weights,
+      InputOutputManager<T> &iom,
+      const MVParameterCuda<T> &mv_pars,
+      const bool out_trans,
+      const bool transposed) {
+    this->computeAnalogMVSinglePass(dev_weights, iom, mv_pars, out_trans, transposed);
+  }
+
+  template <typename OutputIteratorT>
+  bool finalizeOutputPublic(
+      OutputIteratorT out_values,
+      InputOutputManager<T> &iom,
+      const MVParameterCuda<T> &mv_pars,
+      const bool out_trans,
+      const bool transposed) {
+    return this->finalizeOutput(out_values, iom, mv_pars, out_trans, transposed);
+  }
+
 protected:
   // WARNING: uses and overwrites inBuffer
   void computeAnalogMVSinglePass(

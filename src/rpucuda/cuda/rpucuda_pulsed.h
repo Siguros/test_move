@@ -204,6 +204,21 @@ public:
     }
   };
 
+  // --- BEGIN: public bridge thunks for base-class dispatch ---
+  inline void bridgeForwardMatrix(
+      const T* X_input, T* D_output, int m_batch,
+      bool x_trans, bool d_trans, bool is_test) {
+    // call the protected override from inside the class
+    this->forwardMatrix(X_input, D_output, m_batch, x_trans, d_trans, is_test);
+  }
+
+  inline void bridgeForwardVector(
+      const T* x_input, T* d_output, int x_inc, int d_inc, bool is_test) {
+    // call the protected override from inside the class
+    this->forwardVector(x_input, d_output, x_inc, d_inc, is_test);
+  }
+  // --- END: public bridge thunks ---
+
 protected:
   std::unique_ptr<AbstractRPUDevice<T>> rpu_device_ = nullptr;
   std::unique_ptr<AbstractRPUDeviceCuda<T>> rpucuda_device_ = nullptr;

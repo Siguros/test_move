@@ -56,6 +56,7 @@ from .compounds import (
     DynamicTransferCompound,
     MixedPrecisionCompound,
 )
+from .lrtt_compound import LRTTTransferCompound
 from .configs import (
     FloatingPointRPUConfig,
     InferenceRPUConfig,

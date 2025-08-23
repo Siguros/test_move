@@ -59,12 +59,12 @@ namespace RPU {
   } else if (UM && !UBLM) {                                                                        \
     RPU_BLM_SWITCH_TRANS_TEMPLATE(                                                                 \
         X_TRANS, D_TRANS, OUT_TRANS, KERNEL, ARGS, COMMA true COMMA false);                        \
-  } else if (!UM && !UBLM) {                                                                       \
+  } else if (!UM && UBLM) {                                                                        \
     RPU_BLM_SWITCH_TRANS_TEMPLATE(                                                                 \
-        X_TRANS, D_TRANS, OUT_TRANS, KERNEL, ARGS, COMMA false COMMA false);                       \
+        X_TRANS, D_TRANS, OUT_TRANS, KERNEL, ARGS, COMMA false COMMA true);                        \
   } else {                                                                                         \
     RPU_BLM_SWITCH_TRANS_TEMPLATE(                                                                 \
-        X_TRANS, D_TRANS, OUT_TRANS, KERNEL, ARGS, COMMA true COMMA false);                        \
+        X_TRANS, D_TRANS, OUT_TRANS, KERNEL, ARGS, COMMA false COMMA false);                       \
   }
 
 #define RPU_BLM_DEBUG_DEFINE_K_NO_STOROUND                                                         \
@@ -1166,7 +1166,7 @@ __global__ void kernelUpdateGetCounts_Loop2(
   // call << (size/numwarpsperblock,1),warpSize*numwarpsperblock >>
 
   // -- let each warp compute 32 K values
-  // -- no limit for K , however BLocked design might be better for larger K
+  // -- no limit for K , however BLocked design might be위 점검 리스트들을 다 진행한것인가? 이제 build를 진행하면되나? better for larger K
 
   volatile int tid = blockDim.x * blockIdx.x + threadIdx.x;
   const int x_size = x_size_in;
@@ -1528,6 +1528,12 @@ void BitLineMaker<T>::initializeBLBuffers(int m_batch, int BL, int use_bo64, boo
       dev_d_counts_bo64_ = RPU::make_unique<CudaArray<uint64_t>>(context_, d_size_ * m_batch);
       dev_x_counts_bo64_ = RPU::make_unique<CudaArray<uint64_t>>(context_, x_size_ * m_batch);
     }
+  }
+
+  // Allocate raw input buffers if expose_raw_inputs_ is enabled
+  if (expose_raw_inputs_) {
+    dev_x_raw_ = RPU::make_unique<CudaArray<T>>(context_, x_size_ * m_batch);
+    dev_d_raw_ = RPU::make_unique<CudaArray<T>>(context_, d_size_ * m_batch);
   }
 
   context_->synchronize();
@@ -1933,14 +1939,28 @@ template <typename T> void BitLineMaker<T>::getAverageLogAbsMax(T &m_x, T &m_d) 
 #define RPU_BLM_START_KERNEL_LINEAR(ITEM_PER_THREAD)                                               \
   int n = (Kplus1 / ITEM_PER_THREAD);                                                              \
   int nblocks = context_->getNBlocks(x_size_ * n, nthreads_);                                      \
-  kernelUpdateGetCounts_Linear<T, ITEM_PER_THREAD><<<nblocks, nthreads_, 0, s>>>(                  \
-      x_in, x_size_, B, dev_x_counts_->getData(), nullptr, Kplus1,                                 \
-      context_->getRandomStates(nthreads_ * nblocks), res, sr);                                    \
+  if (up.swap_x_d) {                                                                               \
+    /* X counts (now fed by d_in when swapped) */                                                  \
+    kernelUpdateGetCounts_Linear<T, ITEM_PER_THREAD><<<nblocks, nthreads_, 0, s>>>(                \
+        d_in, d_size_, A, dev_x_counts_->getData(), nullptr, Kplus1,                               \
+        context_->getRandomStates(nthreads_ * nblocks), res, sr);                                  \
+  } else {                                                                                          \
+    kernelUpdateGetCounts_Linear<T, ITEM_PER_THREAD><<<nblocks, nthreads_, 0, s>>>(                \
+        x_in, x_size_, B, dev_x_counts_->getData(), nullptr, Kplus1,                               \
+        context_->getRandomStates(nthreads_ * nblocks), res, sr);                                  \
+  }                                                                                                 \
                                                                                                    \
   nblocks = context_->getNBlocks(d_size_ * n, nthreads_);                                          \
-  kernelUpdateGetCounts_Linear<T, ITEM_PER_THREAD><<<nblocks, nthreads_, 0, s>>>(                  \
-      d_in, d_size_, A, dev_d_counts_->getData(), dev_d_noz, Kplus1,                               \
-      context_->getRandomStates(nthreads_ * nblocks), res, sr);
+  if (up.swap_x_d) {                                                                               \
+    /* D counts (fed by x_in when swapped) */                                                      \
+    kernelUpdateGetCounts_Linear<T, ITEM_PER_THREAD><<<nblocks, nthreads_, 0, s>>>(                \
+        x_in, x_size_, B, dev_d_counts_->getData(), dev_d_noz, Kplus1,                             \
+        context_->getRandomStates(nthreads_ * nblocks), res, sr);                                  \
+  } else {                                                                                          \
+    kernelUpdateGetCounts_Linear<T, ITEM_PER_THREAD><<<nblocks, nthreads_, 0, s>>>(                \
+        d_in, d_size_, A, dev_d_counts_->getData(), dev_d_noz, Kplus1,                             \
+        context_->getRandomStates(nthreads_ * nblocks), res, sr);                                  \
+  }
 
 template <typename T>
 template <typename XInputIteratorT, typename DInputIteratorT>
@@ -2016,9 +2036,16 @@ void BitLineMaker<T>::makeCounts(
       umh_ = RPU::make_unique<UpdateManagementHelper<T>>(context_, x_size_, d_size_);
     }
     if (um_if) {
-      umh_->computeKandScaleValues(
-          x_in, d_in, weight_granularity, lr, current_um_, current_ublm_, m_batch, x_trans, d_trans,
-          current_BL_, up.um_reg_scale, up.um_grad_scale);
+      if (up.swap_x_d) {
+        // Swap X and D inputs and their transpose flags
+        umh_->computeKandScaleValues(
+            d_in, x_in, weight_granularity, lr, current_um_, current_ublm_, m_batch, d_trans, x_trans,
+            current_BL_, up.um_reg_scale, up.um_grad_scale);
+      } else {
+        umh_->computeKandScaleValues(
+            x_in, d_in, weight_granularity, lr, current_um_, current_ublm_, m_batch, x_trans, d_trans,
+            current_BL_, up.um_reg_scale, up.um_grad_scale);
+      }
 
       scale_values = umh_->getScaleValueData();
       K_values = umh_->getKValueData();
@@ -2026,6 +2053,20 @@ void BitLineMaker<T>::makeCounts(
       // always compute in this case (expected by CWO)
       umh_->computeKc(m_batch);
     }
+  }
+
+  // ------- capture raw inputs if requested
+  if (expose_raw_inputs_ && dev_x_raw_ && dev_d_raw_) {
+    // Copy the raw inputs to our buffers
+    // Note: We don't swap X/D here even if up.swap_x_d is set
+    // These are the original inputs for LR-TT projections
+    int x_total = x_size_ * m_batch;
+    int d_total = d_size_ * m_batch;
+    
+    // Use existing copyWithIterator utility (handles both direct pointers and iterators)
+    // Signature: copyWithIterator(context, output, input, size)
+    RPU::math::copyWithIterator(context_, dev_x_raw_->getData(), x_in, x_total);
+    RPU::math::copyWithIterator(context_, dev_d_raw_->getData(), d_in, d_total);
   }
 
   // ------- generate the requested bit lines
@@ -2058,11 +2099,20 @@ void BitLineMaker<T>::makeCounts(
     int nblocks = context_->getNBlocks(m, nthreads_);
     nblocks = MAX(MIN(max_block_count_, nblocks), 2);
 
-    RPU_BLM_SWITCH_TRANS_TEMPLATE_UM(
-        x_trans, d_trans, out_trans, current_um_, current_ublm_, kernelUpdateGetCountsBatchImplicit,
-        (x_in, x_size_, B, up.x_res_implicit, dev_x_->getData(), d_in, d_size_, A,
-         up.d_res_implicit, dev_d_->getData(), dev_d_noz, current_BL_ + 1, m_batch, scale_values,
-         K_values, lr / weight_granularity));
+    if (up.swap_x_d) {
+      // Swap X and D inputs, their transpose flags, sizes, and leading dimensions
+      RPU_BLM_SWITCH_TRANS_TEMPLATE_UM(
+          d_trans, x_trans, out_trans, current_um_, current_ublm_, kernelUpdateGetCountsBatchImplicit,
+          (d_in, d_size_, A, up.x_res_implicit, dev_x_->getData(), x_in, x_size_, B,
+           up.d_res_implicit, dev_d_->getData(), dev_d_noz, current_BL_ + 1, m_batch, scale_values,
+           K_values, lr / weight_granularity));
+    } else {
+      RPU_BLM_SWITCH_TRANS_TEMPLATE_UM(
+          x_trans, d_trans, out_trans, current_um_, current_ublm_, kernelUpdateGetCountsBatchImplicit,
+          (x_in, x_size_, B, up.x_res_implicit, dev_x_->getData(), d_in, d_size_, A,
+           up.d_res_implicit, dev_d_->getData(), dev_d_noz, current_BL_ + 1, m_batch, scale_values,
+           K_values, lr / weight_granularity));
+    }
 
   } break;
 
@@ -2091,9 +2141,16 @@ void BitLineMaker<T>::makeCounts(
         // one block  is a little bit faster than TWOBLOCKS
         int nblocks = context_->getNBlocks(MAX(d_size_, x_size_) * 32, nthreads_);
 
-        kernelUpdateGetCounts_Loop2<<<nblocks, nthreads_, 0, s>>>(
-            x_in, x_size_, B, dev_x_counts_->getData(), d_in, d_size_, A, dev_d_counts_->getData(),
-            dev_d_noz, Kplus1, context_->getRandomStates(nthreads_ * nblocks), res, sr);
+        if (up.swap_x_d) {
+          // Swap X and D inputs
+          kernelUpdateGetCounts_Loop2<<<nblocks, nthreads_, 0, s>>>(
+              d_in, x_size_, B, dev_x_counts_->getData(), x_in, d_size_, A, dev_d_counts_->getData(),
+              dev_d_noz, Kplus1, context_->getRandomStates(nthreads_ * nblocks), res, sr);
+        } else {
+          kernelUpdateGetCounts_Loop2<<<nblocks, nthreads_, 0, s>>>(
+              x_in, x_size_, B, dev_x_counts_->getData(), d_in, d_size_, A, dev_d_counts_->getData(),
+              dev_d_noz, Kplus1, context_->getRandomStates(nthreads_ * nblocks), res, sr);
+        }
 
       } else {
         // fast path for smaller K values (needs to be K<=32! and (K + 1) % 2 == 0)
@@ -2128,36 +2185,66 @@ void BitLineMaker<T>::makeCounts(
             Kn = umh_->getKnData(current_ublm_, m_batch);
           }
           auto *random_states = context_->getRandomStates(nthreads_ * nblocks);
-          RPU_BLM_SWITCH_TRANS_TEMPLATE_UM(
-              x_trans, d_trans, out_trans, current_um_, current_ublm_,
-              kernelUpdateGetCountsBatch_SimpleLoop2,
-              (x_in, x_size_, B, dev_x_counts_bo64_->getData(), d_in, d_size_, A,
-               dev_d_counts_bo64_->getData(), dev_d_noz, current_BL_ + 1, m_batch, random_states,
-               res, sr, scale_values, K_values, lr / weight_granularity, Kc_values, Kn));
+          if (up.swap_x_d) {
+            // Swap X and D inputs and their transpose flags
+            RPU_BLM_SWITCH_TRANS_TEMPLATE_UM(
+                d_trans, x_trans, out_trans, current_um_, current_ublm_,
+                kernelUpdateGetCountsBatch_SimpleLoop2,
+                (d_in, d_size_, A, dev_x_counts_bo64_->getData(), x_in, x_size_, B,
+                 dev_d_counts_bo64_->getData(), dev_d_noz, current_BL_ + 1, m_batch, random_states,
+                 res, sr, scale_values, K_values, lr / weight_granularity, Kc_values, Kn));
+          } else {
+            RPU_BLM_SWITCH_TRANS_TEMPLATE_UM(
+                x_trans, d_trans, out_trans, current_um_, current_ublm_,
+                kernelUpdateGetCountsBatch_SimpleLoop2,
+                (x_in, x_size_, B, dev_x_counts_bo64_->getData(), d_in, d_size_, A,
+                 dev_d_counts_bo64_->getData(), dev_d_noz, current_BL_ + 1, m_batch, random_states,
+                 res, sr, scale_values, K_values, lr / weight_granularity, Kc_values, Kn));
+          }
         } else {
 
           // need to set buffers to zero for zero short-cut
           dev_x_counts_->setConst(0);
           dev_d_counts_->setConst(0);
 
-          RPU_BLM_SWITCH_TRANS_TEMPLATE_UM(
-              x_trans, d_trans, out_trans, current_um_, current_ublm_,
-              kernelUpdateGetCountsBatch_SimpleLoop2,
-              (x_in, x_size_, B, dev_x_counts_->getData(), d_in, d_size_, A,
-               dev_d_counts_->getData(), dev_d_noz, current_BL_ + 1, m_batch,
-               context_->getRandomStates(nthreads_ * nblocks), res, sr, scale_values, K_values,
-               lr / weight_granularity));
+          if (up.swap_x_d) {
+            // Swap X and D inputs and their transpose flags
+            RPU_BLM_SWITCH_TRANS_TEMPLATE_UM(
+                d_trans, x_trans, out_trans, current_um_, current_ublm_,
+                kernelUpdateGetCountsBatch_SimpleLoop2,
+                (d_in, d_size_, A, dev_x_counts_->getData(), x_in, x_size_, B,
+                 dev_d_counts_->getData(), dev_d_noz, current_BL_ + 1, m_batch,
+                 context_->getRandomStates(nthreads_ * nblocks), res, sr, scale_values, K_values,
+                 lr / weight_granularity));
+          } else {
+            RPU_BLM_SWITCH_TRANS_TEMPLATE_UM(
+                x_trans, d_trans, out_trans, current_um_, current_ublm_,
+                kernelUpdateGetCountsBatch_SimpleLoop2,
+                (x_in, x_size_, B, dev_x_counts_->getData(), d_in, d_size_, A,
+                 dev_d_counts_->getData(), dev_d_noz, current_BL_ + 1, m_batch,
+                 context_->getRandomStates(nthreads_ * nblocks), res, sr, scale_values, K_values,
+                 lr / weight_granularity));
+          }
         }
       } else {
         int m = MAX(d_size_, x_size_) * m_batch * 32;
         int nblocks = context_->getNBlocks(m, nthreads_);
         nblocks = MIN(max_block_count_, nblocks);
 
-        RPU_BLM_SWITCH_TRANS_TEMPLATE(
-            x_trans, d_trans, out_trans, kernelUpdateGetCountsBatch_Loop2,
-            (x_in, x_size_, B, dev_x_counts_->getData(), d_in, d_size_, A, dev_d_counts_->getData(),
-             dev_d_noz, current_BL_ + 1, m_batch, context_->getRandomStates(nthreads_ * nblocks),
-             res, sr), );
+        if (up.swap_x_d) {
+          // Swap X and D inputs and their transpose flags
+          RPU_BLM_SWITCH_TRANS_TEMPLATE(
+              d_trans, x_trans, out_trans, kernelUpdateGetCountsBatch_Loop2,
+              (d_in, d_size_, A, dev_x_counts_->getData(), x_in, x_size_, B, dev_d_counts_->getData(),
+               dev_d_noz, current_BL_ + 1, m_batch, context_->getRandomStates(nthreads_ * nblocks),
+               res, sr), );
+        } else {
+          RPU_BLM_SWITCH_TRANS_TEMPLATE(
+              x_trans, d_trans, out_trans, kernelUpdateGetCountsBatch_Loop2,
+              (x_in, x_size_, B, dev_x_counts_->getData(), d_in, d_size_, A, dev_d_counts_->getData(),
+               dev_d_noz, current_BL_ + 1, m_batch, context_->getRandomStates(nthreads_ * nblocks),
+               res, sr), );
+        }
       }
     }
     // translate to BO64 if necessary
@@ -2209,6 +2296,9 @@ template class BitLineMaker<half_t>;
 
 RPU_BLM_ITER_TEMPLATE(float, const float *, const float *);
 RPU_BLM_ITER_TEMPLATE(float, float *, float *);
+// Mixed const/non-const for certain paths
+RPU_BLM_ITER_TEMPLATE(float, const float *, float *);
+RPU_BLM_ITER_TEMPLATE(float, float *, const float *);
 RPU_BLM_ITER_TEMPLATE(float, IndexReaderInputIterator<float>, const float *);
 RPU_BLM_ITER_TEMPLATE(float, IndexReaderTransInputIterator<float>, const float *);
 
@@ -2226,6 +2316,11 @@ RPU_BLM_ITER_TEMPLATE(float, IndexReaderSliceInputIterator<TRANSFLOAT(true)>, co
 RPU_BLM_ITER_TEMPLATE(float, IndexReaderSliceInputIterator<TRANSFLOAT(false)>, const float *);
 RPU_BLM_ITER_TEMPLATE(float, EyeInputIterator<float>, const float *);
 RPU_BLM_ITER_TEMPLATE(float, const float *, EyeInputIterator<float>);
+
+// Additional instantiations for LR-TT transfer (x_trans=true, d_trans=false)
+RPU_BLM_ITER_TEMPLATE(float, PermuterTransInputIterator<float>, const float *);
+RPU_BLM_ITER_TEMPLATE(float, IndexReaderTransInputIterator<float>, IndexReaderInputIterator<float>);
+RPU_BLM_ITER_TEMPLATE(float, PermuterTransInputIterator<float>, IndexReaderInputIterator<float>);
 
 #undef TRANSFLOAT
 

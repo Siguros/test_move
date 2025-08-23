@@ -4,8 +4,11 @@
  * Licensed under the MIT license. See LICENSE file in the project root for details.
  */
 
-#include "forward_backward_pass.h"
 #include "rpucuda_pulsed.h"
+#include "rpucuda_simple_device.h"          // Make AbstractRPUDeviceCuda<T> complete for dynamic_cast
+#include "rpucuda_lrtt_transfer_device.h"  // For LR-TT analog forward-inject hook
+#include "rpucuda_vector_device.h"  // For nested Vector→LRTT traversal
+#include "forward_backward_pass.h"
 #include <iostream>
 // #include <random>
 #include <chrono>
@@ -526,7 +529,86 @@ template <typename T> void RPUCudaPulsed<T>::setWeights(const T *host_source) {
       rpucuda_device_->populateFrom(*rpu_device_); // device pars have changed (due to onSetWeights)
     }
   }
+  // 1) Update aggregated buffer (device)
   RPUCudaSimple<T>::setWeights(this->getWeightsPtr()[0]); // set device weights
+  
+  // Get the aggregated weights pointer that was just set
+  T* aggregated_weights = this->dev_weights_ ? this->dev_weights_->getData() : nullptr;
+  
+  // Sync visible weights for LRTT device
+  auto *lrtt = dynamic_cast<LRTTTransferRPUDeviceCuda<T>*>(rpucuda_device_.get());
+  if (lrtt) {
+    if (std::getenv("AIHWKIT_DEBUG_LRTT")) {
+      printf("[DEBUG] Syncing visible weights for top-level LRTT device\n");
+    }
+    lrtt->syncVisibleWithAggregated(aggregated_weights);
+  } else {
+    // Check if Vector contains nested LRTT
+    auto *vec = dynamic_cast<VectorRPUDeviceCuda<T>*>(rpucuda_device_.get());
+    if (vec) {
+      // Count and find LRTT subdevices with one-hot guard (same as forward path)
+      LRTTTransferRPUDeviceCuda<T>* found_lrtt = nullptr;
+      int lrtt_count = 0;
+      int lrtt_index = -1;
+      
+      for (size_t i = 0; i < vec->getRPUDeviceVec().size(); ++i) {
+        const auto &sub = vec->getRPUDeviceVec()[i];
+        auto *lrtt_sub = dynamic_cast<LRTTTransferRPUDeviceCuda<T>*>(sub.get());
+        if (lrtt_sub) {
+          found_lrtt = lrtt_sub;
+          lrtt_index = static_cast<int>(i);
+          lrtt_count++;
+        }
+      }
+      
+      // Apply one-hot guard for nested sync
+      bool perform_nested_sync = false;
+      if (lrtt_count == 1 && found_lrtt && lrtt_index >= 0) {
+        // Check reduce weightening for one-hot condition
+        auto w = vec->getReduceWeightening();
+        bool is_one_hot = true;
+        
+        if (lrtt_index < static_cast<int>(w.size())) {
+          // Check that w[lrtt_index] ≈ 1.0
+          if (std::abs(w[lrtt_index] - 1.0) >= 1e-4) {
+            is_one_hot = false;
+          }
+          
+          // Check that all other w[j] ≈ 0.0
+          for (size_t j = 0; j < w.size(); ++j) {
+            if (static_cast<int>(j) != lrtt_index && std::abs(w[j]) >= 1e-4) {
+              is_one_hot = false;
+              break;
+            }
+          }
+          
+          perform_nested_sync = is_one_hot;
+          
+          if (std::getenv("AIHWKIT_DEBUG_LRTT")) {
+            printf("[DEBUG] setWeights one-hot check for LRTT at index %d: %s\n", 
+                   lrtt_index, is_one_hot ? "PASSED" : "FAILED");
+          }
+        }
+      }
+      
+      if (perform_nested_sync) {
+        if (std::getenv("AIHWKIT_DEBUG_LRTT")) {
+          printf("[DEBUG] Copying visible weights from aggregated for nested LRTT device\n");
+        }
+        // Use copyVisibleWeightsFrom to avoid relying on pointer identity
+        found_lrtt->copyVisibleWeightsFrom(aggregated_weights);
+      } else {
+        // Skip nested sync and log debug message
+        if (std::getenv("AIHWKIT_DEBUG_LRTT")) {
+          if (lrtt_count > 1) {
+            printf("[DEBUG] Multiple LRTT devices (%d) found in Vector, skipping nested sync\n", lrtt_count);
+          } else if (lrtt_count == 1) {
+            printf("[DEBUG] One-hot weightening condition failed, skipping nested sync\n");
+          }
+        }
+      }
+    }
+  }
 }
 
 template <typename T> void RPUCudaPulsed<T>::applyWeightUpdate(T *dw_and_current_weight_out) {
@@ -547,6 +629,9 @@ template <typename T> void RPUCudaPulsed<T>::applyWeightUpdate(T *dw_and_current
 template <typename T>
 void RPUCudaPulsed<T>::forwardMatrix(
     const T *X_input, T *D_output, int m_batch, bool x_trans, bool d_trans, bool is_test) {
+  if (std::getenv("AIHWKIT_DEBUG_LRTT")) {
+    std::cout << "[DEBUG] RPUCudaPulsed::forwardMatrix called!" << std::endl;
+  }
   this->forwardMatrixIterator(X_input, D_output, m_batch, x_trans, d_trans, is_test);
 }
 
@@ -631,6 +716,134 @@ void RPUCudaPulsed<T>::forwardMatrixIterator(
     bool d_trans,
     bool is_test) {
 
+  // Debug: Check what type of device we have
+  if (getenv("AIHWKIT_DEBUG_LRTT")) {
+    printf("[FORWARD DEBUG] RPUCudaPulsed::forwardMatrixIterator called!\n");
+    std::cout << "[DEBUG] forwardMatrixIterator called" << std::endl;
+    std::cout << "[DEBUG] rpucuda_device_ = " << rpucuda_device_.get() << std::endl;
+    if (rpucuda_device_) {
+      std::cout << "[DEBUG] rpucuda_device_ type = " << typeid(*rpucuda_device_).name() << std::endl;
+    }
+  }
+  
+  // 1) Check if top-level is LRTT (direct case)
+  printf("[DEBUG] Checking for LRTT device: rpucuda_device_=%p\n", rpucuda_device_.get());
+  auto *lrtt = dynamic_cast<LRTTTransferRPUDeviceCuda<T>*>(rpucuda_device_.get());
+  if (lrtt) {
+    printf("[DEBUG] Found direct LRTT device!\n");
+    if (lrtt->shouldUseAnalogInject()) {
+      printf("[DEBUG] LRTT shouldUseAnalogInject returned true\n");
+      // Initialize IOM with input
+      f_iom_->initWithInput(X_input, getMetaPar().f_io, this->getXSize(), m_batch, x_trans, 
+                           this->getFwdAlpha(), is_test);
+      
+      // Call LR-TT analog path
+      bool ok = lrtt->forwardWithAnalogInject(
+          D_output,           
+          *f_iom_,            
+          *fb_pass_,          
+          fb_pass_->getFBPars().fwd,  
+          d_trans,            
+          /*transposed=*/false);
+      
+      // Release IOM buffer
+      f_iom_->releaseBuffer();
+      (void)ok; 
+      return;
+    }
+  }
+  
+  // 2) Check if top-level is Vector and contains nested LRTT
+  auto *vec = dynamic_cast<VectorRPUDeviceCuda<T>*>(rpucuda_device_.get());
+  if (vec) {
+    if (getenv("AIHWKIT_DEBUG_LRTT")) {
+      std::cout << "[DEBUG] Found VectorRPUDeviceCuda, checking for nested LRTT..." << std::endl;
+    }
+    
+    // Count and find LRTT subdevices with one-hot guard
+    LRTTTransferRPUDeviceCuda<T>* found_lrtt = nullptr;
+    int lrtt_count = 0;
+    int lrtt_index = -1;
+    
+    for (size_t i = 0; i < vec->getRPUDeviceVec().size(); ++i) {
+      const auto &sub = vec->getRPUDeviceVec()[i];
+      auto *lrtt_sub = dynamic_cast<LRTTTransferRPUDeviceCuda<T>*>(sub.get());
+      if (lrtt_sub && lrtt_sub->shouldUseAnalogInject()) {
+        found_lrtt = lrtt_sub;
+        lrtt_index = static_cast<int>(i);
+        lrtt_count++;
+      }
+    }
+    
+    // Apply one-hot guard for fast path
+    bool use_fast_path = false;
+    if (lrtt_count == 1 && found_lrtt && lrtt_index >= 0) {
+      // Check reduce weightening for one-hot condition
+      auto w = vec->getReduceWeightening();
+      bool is_one_hot = true;
+      
+      if (lrtt_index < static_cast<int>(w.size())) {
+        // Check that w[lrtt_index] ≈ 1.0
+        if (std::abs(w[lrtt_index] - 1.0) >= 1e-4) {
+          is_one_hot = false;
+        }
+        
+        // Check that all other w[j] ≈ 0.0
+        for (size_t j = 0; j < w.size(); ++j) {
+          if (static_cast<int>(j) != lrtt_index && std::abs(w[j]) >= 1e-4) {
+            is_one_hot = false;
+            break;
+          }
+        }
+        
+        use_fast_path = is_one_hot;
+        
+        if (getenv("AIHWKIT_DEBUG_LRTT")) {
+          std::cout << "[DEBUG] One-hot check for LRTT at index " << lrtt_index << ": " 
+                    << (is_one_hot ? "PASSED" : "FAILED") << std::endl;
+          std::cout << "[DEBUG] w[" << lrtt_index << "] = " << w[lrtt_index] << std::endl;
+        }
+      }
+    }
+    
+    // Only use fast path if one-hot condition is met
+    if (use_fast_path) {
+      if (getenv("AIHWKIT_DEBUG_LRTT")) {
+        std::cout << "[DEBUG] Found single nested LRTT device with analog inject enabled!" << std::endl;
+      }
+      // Initialize IOM with input
+      f_iom_->initWithInput(X_input, getMetaPar().f_io, this->getXSize(), m_batch, x_trans,
+                           this->getFwdAlpha(), is_test);
+      
+      // Call nested LR-TT analog path
+      bool ok = found_lrtt->forwardWithAnalogInject(
+          D_output,
+          *f_iom_,
+          *fb_pass_,
+          fb_pass_->getFBPars().fwd,
+          d_trans,
+          /*transposed=*/false);
+      
+      // Release IOM buffer
+      f_iom_->releaseBuffer();
+      (void)ok;
+      return;
+    } else {
+      // Fallback reasons: multiple LRTTs or one-hot condition failed
+      if (lrtt_count > 1) {
+        if (getenv("AIHWKIT_DEBUG_LRTT")) {
+          std::cout << "[DEBUG] Multiple LRTT devices found (" << lrtt_count 
+                    << "), falling back to aggregated path" << std::endl;
+        }
+      } else if (lrtt_count == 1) {
+        if (getenv("AIHWKIT_DEBUG_LRTT")) {
+          std::cout << "[DEBUG] One-hot weightening condition failed, falling back to aggregated path" << std::endl;
+        }
+      }
+    }
+  }
+
+  // Fallback: existing visible-only forward
   fb_pass_->forwardMatrixIterator(
       this->getFBWeightsCuda(is_test), X_input, this->getXSize(), x_trans, D_output,
       this->getDSize(), d_trans, m_batch, this->getFwdAlpha(), *f_iom_, getMetaPar().f_io, is_test);
