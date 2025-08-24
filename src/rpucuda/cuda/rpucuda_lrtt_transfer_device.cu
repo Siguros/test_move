@@ -1705,11 +1705,7 @@ void LRTTTransferRPUDeviceCuda<T>::loadExtra(const RPU::state_t &extra, const st
   initializeDevicePointers();
 }
 
-template class LRTTTransferRPUDeviceCuda<float>;
-#ifdef RPU_USE_DOUBLE
-template class LRTTTransferRPUDeviceCuda<double>;
-#endif
-// NO FP16 instantiation for LR-TT
+// Template instantiations moved to end of file
 
 // Forward-inject implementation: compose W_eff on device
 template <typename T>
@@ -2013,5 +2009,12 @@ void LRTTTransferRPUDeviceCuda<T>::copyBLRFrom(const T* src, cudaStream_t stream
   const int blocks = (r * x + threads - 1) / threads;
   kernelUnpackToFirstKRows<<<blocks, threads, 0, s>>>(dev_w_b_, src, d, x, r);
 }
+
+// Explicit template instantiations - MUST be at the end after all member definitions
+template class LRTTTransferRPUDeviceCuda<float>;
+#ifdef RPU_USE_DOUBLE
+template class LRTTTransferRPUDeviceCuda<double>;
+#endif
+// NO FP16 instantiation for LR-TT
 
 } // namespace RPU
