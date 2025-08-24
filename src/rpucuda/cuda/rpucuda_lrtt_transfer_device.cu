@@ -242,6 +242,13 @@ __global__ void kernelScaleAndAxpyCols(
   W[i] = beta * w + neg_lr * g;
 }
 
+// Simple 1D scaling kernel for sign flip
+template <typename T>
+__global__ void kernelScale1D(T* a, int n, T alpha) {
+  int i = blockDim.x * blockIdx.x + threadIdx.x;
+  if (i < n) a[i] *= alpha;
+}
+
 // Scale and update the first K rows of a matrix
 template <typename T>
 __global__ void kernelScaleAndAxpyRows(
@@ -1176,13 +1183,13 @@ void LRTTTransferRPUDeviceCuda<T>::applyABOuterAsPulsedUpdate(T lr_scale, cudaSt
 
   // PWU computes: W += -lr * D @ X^T
   // We want: W += transfer_lr * A @ B
-  // We pass D = A_chunk, X = B_chunk^T
-  // So PWU computes: W += -lr * A_chunk @ B_chunk
-  // To get W += transfer_lr * A_chunk @ B_chunk, we need lr = -transfer_lr
-  const T lr_eff = -lr_scale;
+  // With StochasticCompressed + UBLM, we need positive LR for valid sqrt(lr_div_dwmin/K)
+  // Solution: Use positive LR and flip D's sign to compensate
+  // PWU: W += -lr * (-A_chunk) @ B_chunk = +lr * A_chunk @ B_chunk
+  const T lr_eff = (T)std::abs((double)lr_scale);  // Ensure positive for UBLM sqrt
 
   if (getenv("AIHWKIT_DEBUG_LRTT")) {
-    printf("[LR-TT] applyABOuterAsPulsedUpdate: K=%d, chunk=%d, lr_scale=%.6e, lr_eff=%.6e\n", 
+    printf("[LR-TT] applyABOuterAsPulsedUpdate: K=%d, chunk=%d, lr_scale=%.6e, lr_eff=%.6e (positive for UBLM)\n", 
            K, chunk, (float)lr_scale, (float)lr_eff);
   }
 
@@ -1198,6 +1205,11 @@ void LRTTTransferRPUDeviceCuda<T>::applyABOuterAsPulsedUpdate(T lr_scale, cudaSt
     const int nD = this->d_size_ * cur;
     kernelPackColsWithOffset<<<(nD + threads - 1)/threads, threads, 0, s>>>(
         dev_temp_d_->getData(), dev_w_a_, this->d_size_, this->x_size_, cur, off);
+    
+    // NEW: Flip sign on D so final update is +lr * (A_chunk @ B_chunk)
+    // This compensates for PWU's inherent minus sign
+    kernelScale1D<<<(nD + threads - 1)/threads, threads, 0, s>>>(
+        dev_temp_d_->getData(), nD, (T)-1);
 
     // Pack B_chunk = B[off:off+cur, :] -> dev_temp_x_ [cur × x]
     const int nX = cur * this->x_size_;
@@ -1735,8 +1747,13 @@ void LRTTTransferRPUDeviceCuda<T>::doLoRAPulsedUpdate_(
 
   cudaStream_t s = up_context ? up_context->getStream() : this->context_->getStream();
   
-  // Make sure all math/pwu ops run on the same stream as the pack/route kernels
-  CudaStreamGuard guard(this->context_, s);
+  // Ensure all math/PWU operations use the same stream as pack/route kernels
+  // This prevents cross-stream races when up_context stream differs from this->context_ stream
+  cudaStream_t original_stream = this->context_->getStream();
+  bool need_stream_switch = (s != original_stream);
+  if (need_stream_switch) {
+    this->context_->setExternalStream(s);
+  }
   
   const int K = rank_;
   const int threads = 256;
@@ -1799,6 +1816,11 @@ void LRTTTransferRPUDeviceCuda<T>::doLoRAPulsedUpdate_(
         x_in,                   // X = original X
         dev_d_pad_->getData(),  // D = padded D_A (rank rows)
         dev_w_b_, devB, up, lr, m_batch, /*x_trans=*/false, /*d_trans=*/false);
+  }
+  
+  // Restore original stream if we switched it
+  if (need_stream_switch) {
+    this->context_->releaseExternalStream();
   }
 }
 
@@ -1880,9 +1902,6 @@ void LRTTTransferRPUDeviceCuda<T>::composeForwardInject(
   
   // Wait for any pending visible sync from another stream
   waitVisibleSyncOn(s);
-  
-  // Use stream guard to ensure all operations (including GEMM) use the same stream
-  CudaStreamGuard guard(this->context_, s);
   
   // Fix A: Ensure visible weights are synced on first forward
   if (!visible_synced_ && last_agg_ptr_) {
@@ -2109,6 +2128,10 @@ void LRTTTransferRPUDeviceCuda<T>::copyVisibleWeightsTo(T* dst, cudaStream_t str
   const int d = this->d_size_;
   const int x = this->x_size_;
   cudaStream_t s = stream ? stream : this->context_->getStream();
+  
+  // Wait for any pending visible-sync event before reading
+  const_cast<LRTTTransferRPUDeviceCuda<T>*>(this)->waitVisibleSyncOn(s);
+  
   RPU::math::copy<T>(this->context_, d * x, dev_w_visible_, 1, dst, 1);
 }
 

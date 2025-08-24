@@ -462,4 +462,4 @@ def test_lrtt_with_transfer_every(transfer_every_val):
 
 
 if __name__ == "__main__":
-    test_direct_tile_update()
+    test_lrtt_with_transfer_every(transfer_every_val=3)
