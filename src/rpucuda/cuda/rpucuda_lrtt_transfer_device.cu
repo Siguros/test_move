@@ -18,6 +18,8 @@
 #include <algorithm>        // std::min, std::max
 #include <cmath>            // std::round, std::sqrt
 #include <cstdlib>          // std::getenv
+#include <sstream>          // std::ostringstream
+#include <cstdio>           // printf
 #include <curand_kernel.h>  // curandState_t, curand_normal(_double)
 
 namespace RPU {
@@ -154,21 +156,26 @@ __device__ inline double _curand_gauss<double>(curandState_t* states, int idx) {
 }
 #endif
 
-// A[:, :K] -> Kaiming Normal with std
-// Matrix shape is col-major [d, x_size]; we touch the first K columns.
+// Stateless Kaiming Normal initialization for first K columns
+// Uses Philox RNG with per-thread initialization - no external state needed
 template <typename T>
-__global__ void kernelKaimingInitFirstKCols(
-    T* W, int d, int x_size, int K, T std, curandState_t* states) {
-
+__global__ void kernelKaimingInitFirstKColsStateless(
+    T* W, int d, int x_size, int K, unsigned long long seed, T std) {
+  
   int i = blockDim.x * blockIdx.x + threadIdx.x; // 0..(d*K-1)
-  if (i >= d * K) return;
+  int n = d * K;
+  if (i >= n) return;
+  
   int row = i % d;     // col-major: row cycles faster
   int col = i / d;     // 0..K-1 (column index in the K columns)
   int idx = row + col * d;  // col-major indexing
-
-  // Each thread uses its own RNG state index
-  int sid = blockIdx.x * blockDim.x + threadIdx.x;
-  T z = _curand_gauss<T>(states, sid) * std;
+  
+  // Initialize Philox RNG state for this thread
+  curandStatePhilox4_32_10_t rng;
+  curand_init(seed, /*subsequence=*/(unsigned long long)i, /*offset=*/0ULL, &rng);
+  
+  // Generate normal deviate and scale by std
+  T z = (T)curand_normal(&rng) * std;
   W[idx] = z;
 }
 
@@ -812,6 +819,23 @@ void LRTTTransferRPUDeviceCuda<T>::populateFrom(const AbstractRPUDevice<T> &rpu_
     }
   }
   
+  // Validate transfer cadence for LR-TT
+  const auto& par = getPar();
+  if (par.update_rule == LRUpdateRule::LR_TT) {
+    if (par.transfer_every <= 0) {
+      RPU_FATAL("LR-TT requires transfer_every > 0 to guarantee periodic transfer A@B -> visible. "
+                "Current value: " << par.transfer_every);
+    }
+    if (par.n_reads_per_transfer > 0) {
+      RPU_FATAL("LR-TT requires n_reads_per_transfer == 0 (parent read-based transfer is disabled). "
+                "Current value: " << par.n_reads_per_transfer);
+    }
+    if (getenv("AIHWKIT_DEBUG_LRTT")) {
+      printf("[LR-TT CUDA] Transfer validation passed: transfer_every=%d, n_reads_per_transfer=%d\n",
+             par.transfer_every, par.n_reads_per_transfer);
+    }
+  }
+  
   // Reset all counters
   transfer_counter_ = 0;
   num_a_updates_ = 0;
@@ -888,9 +912,17 @@ void LRTTTransferRPUDeviceCuda<T>::runUpdateKernel(
     uint32_t *d_counts_chunk,
     const ChoppedWeightOutput<T> *cwo) {
   
+  // Validate preconditions for LR-TT operation
+  const auto &par = this->getPar();
+  if (par.update_rule != LRUpdateRule::LR_TT) {
+    RPU_FATAL("LRTTTransferRPUDeviceCuda requires update_rule == LR_TT");
+  }
+  if (rank_ <= 0) {
+    RPU_FATAL("LRTTTransferRPUDeviceCuda requires rank > 0");
+  }
+  
   // Handle fully hidden case
   if (this->fully_hidden_) {
-    const auto& par = this->getPar();
     this->dev_weights_ptrs_[par.idx_visible] = dev_weights;
     dev_w_visible_ = dev_weights;  // Ensure consistent buffer usage in transfer path
   }
@@ -903,35 +935,37 @@ void LRTTTransferRPUDeviceCuda<T>::runUpdateKernel(
     }
   }
   
+  // Ensure scratch buffers are allocated before use
+  ensureABScratch_();
+  ensurePaddedBuffers(m_batch);
+  
   if (getenv("AIHWKIT_DEBUG_LRTT")) {
-    printf("[LR-TT DEBUG] update path: pulsed\n");
+    printf("[LR-TT DEBUG] runUpdateKernel: pulsed path, rank=%d, m_batch=%d\n", rank_, m_batch);
   }
   
-  // Update both A and B every step by calling sub-devices directly
-  const auto &par = this->getPar();
-  
   // Step-2: LR-TT always uses pulsed LoRA-style updates  
-  if (par.update_rule == LRUpdateRule::LR_TT) {
+  {
     // LoRA pulsed path with projected signals
     if (getenv("AIHWKIT_DEBUG_LRTT")) {
       printf("[LR-TT DEBUG] LoRA pulsed path (Step-2: always StochasticCompressed)\n");
     }
     
-    // Get raw input pointers from BitLineMaker
-    const T* x_in = nullptr;
-    const T* d_in = nullptr;
-    if (blm) {
-      x_in = blm->getXData();  // non-null only for FP format (implicit pulses)
-      d_in = blm->getDData();
-      if (!x_in || !d_in) {
-        // STOCHASTIC_COMPRESSED path: fall back to raw inputs captured by BLM
-        x_in = blm->getRawXData();
-        d_in = blm->getRawDData();
+    // Get input pointers from BitLineMaker - LR-TT requires these for pulsed updates
+    const T* x_in = blm ? blm->getXData() : nullptr;
+    const T* d_in = blm ? blm->getDData() : nullptr;
+    
+    if (!x_in || !d_in) {
+      // For StochasticCompressed mode, getXData/getDData may return null
+      // Try the raw/analog accessors which should be available
+      if (blm) {
+        x_in = blm->getAnalogX();
+        d_in = blm->getAnalogD();
       }
     }
     
     if (!x_in || !d_in) {
-      RPU_FATAL("LR-TT Step-2: BitLineMaker did not expose X/D inputs for pulsed update");
+      RPU_FATAL("LR-TT: BitLineMaker must expose X/D inputs for StochasticCompressed pulsed updates. "
+                "Ensure PulsedWeightUpdater calls setExposeRawInputs(true) on BitLineMaker.");
     }
     
     // Step-2: Enforce StochasticCompressed mode for all LR-TT updates
@@ -968,222 +1002,12 @@ void LRTTTransferRPUDeviceCuda<T>::runUpdateKernel(
                transfer_counter_, transfer_every);
       }
       doTransfer(up_context->getStream());
+      num_transfers_++;  // Increment transfer counter
     }
     
     // Reduce to aggregated weights
     this->reduceToWeights(up_context, dev_weights);
-    return;
-  }
-  
-  // Apply gradient magnitude correction if enabled
-  T lr_scale_a = lr;
-  T lr_scale_b = lr;
-  if (par.correct_gradient_magnitudes && rank_ > 0) {
-    // Scale learning rates by std::sqrt(rank) to correct for low-rank gradient magnitudes
-    // This compensates for the reduced expressivity of low-rank updates
-    T correction = std::sqrt((T)rank_);
-    lr_scale_a = lr * correction;
-    lr_scale_b = lr * correction;
-  }
-  
-  // Handle swap_xd for A/B updates (training path)
-  // Note: swap_xd affects only the fast A/B device updates, NOT the transfer
-  // The transfer must remain W += A[:,:K] @ B[:K,:] for dimensional validity
-  
-  // Create local copies of update parameters for A and B
-  auto up_a = up;
-  auto up_b = up;
-  
-  // CRITICAL: B needs swap_x_d=true to write transpose, A doesn't
-  up_a.swap_x_d = false;  // A gets gradient normally (d x batch)
-  up_b.swap_x_d = true;   // B gets gradient transposed (batch x d) -> writes to rows
-  
-  if (par.swap_xd) {
-    // If global swap_xd is set, swap both
-    up_a.swap_x_d = true;
-    up_b.swap_x_d = false;
-    DEBUG_OUT("swap_xd enabled: swapping both A and B update directions");
-  }
-  
-  // DEBUG: Print norms before updates
-#if !defined(RPU_USE_FP16) || !defined(AIHWKIT_DEBUG_LRTT)
-  if (getenv("AIHWKIT_DEBUG_LRTT")) {
-    printf("[LR-TT DEBUG] Before updates - A.swap_x_d=%d, B.swap_x_d=%d\n", 
-           (int)up_a.swap_x_d, (int)up_b.swap_x_d);
-#ifndef RPU_USE_FP16
-    printFrobNorms(this->context_, dev_w_a_, dev_w_b_, dev_w_visible_, 
-                   this->d_size_, this->x_size_, rank_, "BEFORE_UPDATE");
-#endif
-  }
-#endif
-  
-  // 1) Update fast device A with the gradient
-  
-  if (getenv("AIHWKIT_DEBUG_LRTT")) {
-    printf("[LR-TT DEBUG] Updating fastA (idx=%d, swap=%d)\n", 
-           par.idx_fastA, (int)up_a.swap_x_d);
-  }
-  
-  // Store A norm before update for validation
-  T norm_a_before = 0;
-#if !defined(RPU_USE_FP16) || !defined(AIHWKIT_DEBUG_LRTT)
-  if (getenv("AIHWKIT_DEBUG_LRTT")) {
-#ifndef RPU_USE_FP16
-    cudaStream_t s = up_context->getStream();
-    CudaArray<T> temp_norm(this->context_, 1);
-    temp_norm.setConst(0.0);
-    kernelFrobNormFirstK<<<(this->d_size_*rank_ + 255)/256, 256, 0, s>>>(
-        dev_w_a_, this->d_size_, this->x_size_, rank_, temp_norm.getData(), true);
-    up_context->synchronize();  // Ensure kernel completes before copyTo
-    temp_norm.copyTo(&norm_a_before);
-#endif
-  }
-#endif
-  
-  // Call the sub-device directly for A
-  this->rpucuda_device_vec_[par.idx_fastA]->runUpdateKernel(
-      kpars, up_context, this->dev_weights_ptrs_[par.idx_fastA], m_batch, 
-      blm, up_a, lr_scale_a, dev_states, one_sided, x_counts_chunk, d_counts_chunk, cwo);
-  num_a_updates_++;  // Increment A update counter
-  
-  // Validate A was updated
-#if !defined(RPU_USE_FP16) || !defined(AIHWKIT_DEBUG_LRTT)
-  if (getenv("AIHWKIT_DEBUG_LRTT")) {
-#ifndef RPU_USE_FP16
-    cudaStream_t s = up_context->getStream();
-    T norm_a_after = 0;
-    CudaArray<T> temp_norm(this->context_, 1);
-    temp_norm.setConst(0.0);
-    kernelFrobNormFirstK<<<(this->d_size_*rank_ + 255)/256, 256, 0, s>>>(
-        dev_w_a_, this->d_size_, this->x_size_, rank_, temp_norm.getData(), true);
-    temp_norm.copyTo(&norm_a_after);
-    up_context->synchronize();
-    
-    if (norm_a_after > norm_a_before * 0.99 || norm_a_after == 0) {
-      printf("[LR-TT ASSERT] A update validated: ||A|| %.6e -> %.6e\n",
-             (float)norm_a_before, (float)norm_a_after);
-    } else {
-      printf("[LR-TT WARNING] A may not have updated properly: ||A|| %.6e -> %.6e\n",
-             (float)norm_a_before, (float)norm_a_after);
-    }
-    
-    // Full debug norms
-    if (getenv("AIHWKIT_DEBUG_LRTT")) {
-      printFrobNorms(this->context_, dev_w_a_, dev_w_b_, dev_w_visible_, 
-                     this->d_size_, this->x_size_, rank_, "AFTER_A");
-    }
-#endif
-  }
-#endif
-  
-  // Synchronize to ensure A update completes before B starts
-  up_context->synchronize();
-  
-  // 2) Update fast device B with the transposed gradient
-  
-  if (getenv("AIHWKIT_DEBUG_LRTT")) {
-    printf("[LR-TT DEBUG] Updating fastB (idx=%d, swap=%d)\n", 
-           par.idx_fastB, (int)up_b.swap_x_d);
-  }
-  
-  // Store B norm before update for validation
-  T norm_b_before = 0;
-#if !defined(RPU_USE_FP16) || !defined(AIHWKIT_DEBUG_LRTT)
-  if (getenv("AIHWKIT_DEBUG_LRTT")) {
-#ifndef RPU_USE_FP16
-    cudaStream_t s = up_context->getStream();
-    CudaArray<T> temp_norm(this->context_, 1);
-    temp_norm.setConst(0.0);
-    kernelFrobNormFirstK<<<(rank_*this->x_size_ + 255)/256, 256, 0, s>>>(
-        dev_w_b_, this->d_size_, this->x_size_, rank_, temp_norm.getData(), false);
-    up_context->synchronize();  // Ensure kernel completes before copyTo
-    temp_norm.copyTo(&norm_b_before);
-#endif
-  }
-#endif
-  
-  // Call the sub-device directly for B
-  this->rpucuda_device_vec_[par.idx_fastB]->runUpdateKernel(
-      kpars, up_context, this->dev_weights_ptrs_[par.idx_fastB], m_batch,
-      blm, up_b, lr_scale_b, dev_states, one_sided, x_counts_chunk, d_counts_chunk, cwo);
-  num_b_updates_++;  // Increment B update counter
-  
-  // Validate B was updated
-#if !defined(RPU_USE_FP16) || !defined(AIHWKIT_DEBUG_LRTT)
-  if (getenv("AIHWKIT_DEBUG_LRTT")) {
-#ifndef RPU_USE_FP16
-    cudaStream_t s = up_context->getStream();
-    T norm_b_after = 0;
-    CudaArray<T> temp_norm(this->context_, 1);
-    temp_norm.setConst(0.0);
-    kernelFrobNormFirstK<<<(rank_*this->x_size_ + 255)/256, 256, 0, s>>>(
-        dev_w_b_, this->d_size_, this->x_size_, rank_, temp_norm.getData(), false);
-    temp_norm.copyTo(&norm_b_after);
-    up_context->synchronize();
-    
-    if (norm_b_after > norm_b_before * 0.99 || norm_b_before == 0) {
-      printf("[LR-TT ASSERT] B update validated: ||B|| %.6e -> %.6e\n",
-             (float)norm_b_before, (float)norm_b_after);
-    } else {
-      printf("[LR-TT WARNING] B may not have updated properly: ||B|| %.6e -> %.6e\n",
-             (float)norm_b_before, (float)norm_b_after);
-    }
-    
-    // Full debug norms
-    if (getenv("AIHWKIT_DEBUG_LRTT")) {
-      printFrobNorms(this->context_, dev_w_a_, dev_w_b_, dev_w_visible_, 
-                     this->d_size_, this->x_size_, rank_, "AFTER_B");
-    }
-#endif
-  }
-#endif
-  
-  // Synchronize to ensure B update completes
-  up_context->synchronize();
-  
-  
-  // Our LR-TT transfer schedule (no parent transfer occurs because n_reads_per_transfer = 0)
-  // Use increment-then-compare pattern
-  int transfer_every = par.transfer_every;
-  if (par.units_in_mbatch) {
-    transfer_every *= m_batch;
-  }
-  
-  if (transfer_every > 0 && (++transfer_counter_ >= transfer_every)) {
-    transfer_counter_ = 0;  // Reset counter
-    // Trigger transfer: W_to += lr_scale * (A[:,:rank] @ B[:rank,:])
-    if (getenv("AIHWKIT_DEBUG_LRTT")) {
-      printf("[LR-TT DEBUG] Transfer triggered (counter=%d, every=%d)\n", 
-             transfer_counter_, transfer_every);
-      printFrobNorms(this->context_, dev_w_a_, dev_w_b_, dev_w_visible_, 
-                     this->d_size_, this->x_size_, rank_, "BEFORE_TRANSFER");
-    }
-    
-    // Print L1 norms if debug environment variable is set
-    if (getenv("AIHWKIT_DEBUG_LRTT")) {
-      printL1Norms(this->context_, dev_w_a_, dev_w_b_, dev_w_visible_, 
-                   this->d_size_, this->x_size_, rank_, "BEFORE_TRANSFER");
-    }
-    
-    doTransfer(up_context->getStream());
-    num_transfers_++;  // Increment transfer counter
-    
-    // Synchronize after transfer to ensure it completes
-    up_context->synchronize();
-    
-    if (getenv("AIHWKIT_DEBUG_LRTT")) {
-      printFrobNorms(this->context_, dev_w_a_, dev_w_b_, dev_w_visible_, 
-                     this->d_size_, this->x_size_, rank_, "AFTER_TRANSFER");
-    }
-    
-    // Print debug stats periodically
-    if (getenv("AIHWKIT_DEBUG_LRTT")) {
-      printDebugStats();
-    }
-  }
-  
-  // CRITICAL: Reduce sub-device weights back to aggregated weights
-  this->reduceToWeights(up_context, dev_weights);
+  }  // End of LR-TT pulsed path block
 }
 
 template <typename T>
@@ -1207,6 +1031,7 @@ void LRTTTransferRPUDeviceCuda<T>::doTransfer(cudaStream_t stream) {
   // with proper stream ordering to avoid races
 }
 
+
 template <typename T>
 void LRTTTransferRPUDeviceCuda<T>::applyABOuterAsPulsedUpdate(T lr_scale, cudaStream_t stream) {
   const int K = rank_;
@@ -1214,7 +1039,7 @@ void LRTTTransferRPUDeviceCuda<T>::applyABOuterAsPulsedUpdate(T lr_scale, cudaSt
   if (K > std::min(this->d_size_, this->x_size_)) {
     std::ostringstream ss;
     ss << "LR-TT transfer: rank (" << K << ") exceeds dims d=" << this->d_size_ << ", x=" << this->x_size_;
-    RPU_FATAL(ss.str());
+    RPU_FATAL(ss.str().c_str());
   }
   
   initializeDevicePointers(); // if needed
@@ -1236,27 +1061,23 @@ void LRTTTransferRPUDeviceCuda<T>::applyABOuterAsPulsedUpdate(T lr_scale, cudaSt
   if (!devVis) {
     std::ostringstream ss;
     ss << "LR-TT transfer requires pulsed visible tile (idx_visible=" << par.idx_visible << ").";
-    RPU_FATAL(ss.str());
+    RPU_FATAL(ss.str().c_str());
   }
 
   const T lr_eff = -lr_scale; // PWU computes -lr * D * X^T
 
-#ifdef AIHWKIT_DEBUG_LRTT
   if (getenv("AIHWKIT_DEBUG_LRTT")) {
     printf("[LR-TT] applyABOuterAsPulsedUpdate: K=%d, chunk=%d, lr_scale=%.6e, lr_eff=%.6e\n", 
            K, chunk, (float)lr_scale, (float)lr_eff);
   }
-#endif
 
   for (int off = 0; off < K; off += chunk) {
     const int cur = std::min(chunk, K - off);
 
-#ifdef AIHWKIT_DEBUG_LRTT
     if (getenv("AIHWKIT_DEBUG_LRTT")) {
       printf("[LR-TT]   chunk [%d:%d) (cur=%d) A[:,%d:%d] @ B[%d:%d,:]\n", 
              off, off+cur, cur, off, off+cur, off, off+cur);
     }
-#endif
 
     // D_chunk = A[:, off:off+cur]  -> dev_temp_d_ [d × cur]
     const int nD = this->d_size_ * cur;
@@ -1292,44 +1113,55 @@ void LRTTTransferRPUDeviceCuda<T>::applyABOuterAsPulsedUpdate(T lr_scale, cudaSt
 
 template <typename T>
 void LRTTTransferRPUDeviceCuda<T>::reinitFastTiles(cudaStream_t stream) {
-  // Reinitialize fast tiles according to Step 1 spec:
-  // A (entire matrix): Kaiming(He) normal initialization
-  // B (entire matrix): all zeros
+  const int K = rank_;
+  if (K <= 0) return;
   
-  const auto& par = getPar();
-  const T fan_in = (T)this->x_size_; // for forward pass y = W * x
-  const T std_dev = par.reinit_gain * std::sqrt((T)2.0 / fan_in); // He initialization
-  
-  // Use provided stream or context stream
-  cudaStream_t exec_stream = stream ? stream : this->context_->getStream();
-  
+  cudaStream_t s = stream ? stream : this->context_->getStream();
   const int threads = 256;
-  const int full_size = this->d_size_ * this->x_size_;
-  const int blocks = (full_size + threads - 1) / threads;
   
-  // A: Kaiming(He) normal initialization over entire matrix
-  curandState_t *rng = this->context_->getRandomStates(threads * blocks);
-  kernelKaimingInitFirstKCols<<<blocks, threads, 0, exec_stream>>>(
-      dev_w_a_, this->d_size_, this->x_size_, this->x_size_, std_dev, rng);
+  if (getenv("AIHWKIT_DEBUG_LRTT")) {
+    printf("[LR-TT] reinitFastTiles: K=%d, reinit_gain=%.6e\n", K, getPar().reinit_gain);
+  }
+  
+  // A: Kaiming(He) normal initialization for first K columns
+  const int nA = this->d_size_ * K;
+  const int blocks_A = (nA + threads - 1) / threads;
+  
+  // Generate seed for stateless RNG - combine device pointer, counter, and random value
+  // This ensures different initialization each time reinit is called
+  static unsigned long long reinit_counter = 0;
+  reinit_counter++;
+  unsigned long long seed = ((unsigned long long)(uintptr_t)dev_w_a_ ^ reinit_counter) + 
+                            (unsigned long long)std::rand();
+  
+  // Calculate Kaiming standard deviation: gain * sqrt(2/fan_in)
+  const T std_dev = getPar().reinit_gain * std::sqrt((T)2.0 / (T)this->d_size_);
+  
+  // Use stateless kernel - no external curand states needed
+  kernelKaimingInitFirstKColsStateless<<<blocks_A, threads, 0, s>>>(
+    dev_w_a_, this->d_size_, this->x_size_, K, seed, std_dev);
   
   // B: all zeros over entire matrix
-  kernelResetWeights<<<blocks, threads, 0, exec_stream>>>(dev_w_b_, full_size);
+  const int full_size = this->d_size_ * this->x_size_;
+  const int blocks_B = (full_size + threads - 1) / threads;
+  kernelResetWeights<<<blocks_B, threads, 0, s>>>(dev_w_b_, full_size);
 }
 
 template <typename T>
 void LRTTTransferRPUDeviceCuda<T>::printDebugStats() const {
-#ifdef AIHWKIT_DEBUG_LRTT
-  printf("[LR-TT STATS] A_updates=%d, B_updates=%d, transfers=%d\n", 
-         num_a_updates_, num_b_updates_, num_transfers_);
+  printf("[LR-TT STATS] A_updates=%d, B_updates=%d, transfers=%d, rank=%d\n", 
+         num_a_updates_, num_b_updates_, num_transfers_, rank_);
+  
   // Guard against calling before first update pair
   if (num_a_updates_ > 0 || num_b_updates_ > 0) {
     if (num_a_updates_ != num_b_updates_) {
       printf("[LR-TT WARNING] A and B update counts differ! A=%d, B=%d. This indicates an issue.\n",
              num_a_updates_, num_b_updates_);
+#ifdef AIHWKIT_DEBUG_LRTT
       RPU_FATAL("LR-TT: A and B update counts must be equal for proper gradient accumulation");
+#endif
     }
   }
-#endif
 }
 
 template <typename T>
@@ -1369,12 +1201,17 @@ void LRTTTransferRPUDeviceCuda<T>::doDirectUpdate(
   
   // Check if we should use LoRA-style updates
   if (par.update_rule == LRUpdateRule::LR_TT) {
-    // Use LoRA-style updates
+    // LR-TT MUST use pulsed path to maintain "always pulsed" guarantee
     if (getenv("AIHWKIT_DEBUG_LRTT")) {
-      printf("[LR-TT DEBUG] Using LoRA-style updates (LR_TT mode)\n");
+      printf("[LR-TT DEBUG] Using pulsed LoRA updates (LR_TT mode - always pulsed)\n");
     }
     
-    doLoRAUpdate(x_in, d_in, dev_weights, lr, m_batch, this->context_->getStream(), beta);
+    // Enforce StochasticCompressed for pulsed path
+    auto up_local = up;
+    enforceStochasticCompressed(up_local);
+    
+    // Use pulsed LoRA update - NOT the GEMM-based doLoRAUpdate
+    doLoRAPulsedUpdate_(x_in, d_in, lr, m_batch, up_local, this->context_);
     num_a_updates_++;
     num_b_updates_++;
   } else {
@@ -1443,58 +1280,65 @@ void LRTTTransferRPUDeviceCuda<T>::doDirectUpdate(
              transfer_counter_, transfer_every);
     }
     
-    // For NONE path, use GEMM fallback for transfer
+    // For LR-TT, use pulsed transfer; for legacy path use GEMM fallback
     if (rank_ > 0 && par.transfer_lr != 0) {
-      const int threads = 256;
-      cudaStream_t ctx_stream = this->context_->getStream();
+      if (par.update_rule == LRUpdateRule::LR_TT) {
+        // LR-TT: Use pulsed transfer to maintain "always pulsed" guarantee
+        doTransfer(this->context_->getStream());
+        num_transfers_++;
+      } else {
+        // Legacy path: use GEMM fallback for transfer
+        const int threads = 256;
+        cudaStream_t ctx_stream = this->context_->getStream();
+        
+        // Pack A columns and B rows on context stream (same as GEMM)
+        const int d_k_size = this->d_size_ * rank_;
+        const int blocks_a = (d_k_size + threads - 1) / threads;
+        kernelPackColsWithOffset<<<blocks_a, threads, 0, ctx_stream>>>(
+            dev_temp_d_->getData(), dev_w_a_,
+            this->d_size_, this->x_size_, rank_, 0);
+        
+        const int k_x_size = rank_ * this->x_size_;
+        const int blocks_b = (k_x_size + threads - 1) / threads;
+        kernelPackRowsWithOffset<<<blocks_b, threads, 0, ctx_stream>>>(
+            dev_temp_x_->getData(), dev_w_b_,
+            this->d_size_, this->x_size_, rank_, 0);
+        
+        // GEMM fallback: W += transfer_lr * (A[:,:K] @ B[:K,:])
+        RPU::math::gemm<T>(
+            this->context_,
+            /*trans_A=*/false,  // A_lr is [d_size, K] col-major
+            /*trans_B=*/false,  // B_lr is [K, x_size] col-major
+            this->d_size_,      // M
+            this->x_size_,      // N
+            rank_,              // K
+            par.transfer_lr,    // alpha
+            dev_temp_d_->getData(), // A
+            this->d_size_,      // lda (col-major: A_lr is [d_size, K], so ld = d_size)
+            dev_temp_x_->getData(), // B
+            rank_,              // ldb (col-major: B_lr is [K, x_size], so ld = K)
+            (T)1.0,             // beta
+            dev_w_visible_,     // C
+            this->d_size_);     // ldc (col-major: W is [d_size, x_size], so ld = d_size)
       
-      // Pack A columns and B rows on context stream (same as GEMM)
-      const int d_k_size = this->d_size_ * rank_;
-      const int blocks_a = (d_k_size + threads - 1) / threads;
-      kernelPackColsWithOffset<<<blocks_a, threads, 0, ctx_stream>>>(
-          dev_temp_d_->getData(), dev_w_a_,
-          this->d_size_, this->x_size_, rank_, 0);
+        // Reinitialize fast tiles on context stream (same as GEMM)
+        reinitFastTiles(ctx_stream);
+        num_transfers_++;
       
-      const int k_x_size = rank_ * this->x_size_;
-      const int blocks_b = (k_x_size + threads - 1) / threads;
-      kernelPackRowsWithOffset<<<blocks_b, threads, 0, ctx_stream>>>(
-          dev_temp_x_->getData(), dev_w_b_,
-          this->d_size_, this->x_size_, rank_, 0);
-      
-      // GEMM fallback: W += transfer_lr * (A[:,:K] @ B[:K,:])
-      RPU::math::gemm<T>(
-          this->context_,
-          /*trans_A=*/false,  // A_lr is [d_size, K] col-major
-          /*trans_B=*/false,  // B_lr is [K, x_size] col-major
-          this->d_size_,      // M
-          this->x_size_,      // N
-          rank_,              // K
-          par.transfer_lr,    // alpha
-          dev_temp_d_->getData(), // A
-          this->d_size_,      // lda (col-major: A_lr is [d_size, K], so ld = d_size)
-          dev_temp_x_->getData(), // B
-          rank_,              // ldb (col-major: B_lr is [K, x_size], so ld = K)
-          (T)1.0,             // beta
-          dev_w_visible_,     // C
-          this->d_size_);     // ldc (col-major: W is [d_size, x_size], so ld = d_size)
-      
-      // Reinitialize fast tiles on context stream (same as GEMM)
-      reinitFastTiles(ctx_stream);
-      num_transfers_++;
-      
-      if (getenv("AIHWKIT_DEBUG_LRTT")) {
-        T norm_w = 0;
-        CudaArray<T> temp_norm(this->context_, 1);
-        temp_norm.setConst(0.0);
-        dim3 blocks((this->d_size_*this->x_size_ + 255) / 256);
-        kernelFrobNormFirstK<<<blocks, 256, 0, ctx_stream>>>(
-            dev_w_visible_, this->d_size_, this->x_size_, 
-            std::min(this->d_size_, this->x_size_), temp_norm.getData(), true);
-        temp_norm.copyTo(&norm_w);
-        this->context_->synchronize();
-        printf("[LR-TT DIRECT] After transfer: ||W||_F = %.6e\n", (float)norm_w);
-      }
-    }
+        if (getenv("AIHWKIT_DEBUG_LRTT")) {
+          T norm_w = 0;
+          CudaArray<T> temp_norm(this->context_, 1);
+          temp_norm.setConst(0.0);
+          dim3 blocks((this->d_size_*this->x_size_ + 255) / 256);
+          kernelFrobNormFirstK<<<blocks, 256, 0, ctx_stream>>>(
+              dev_w_visible_, this->d_size_, this->x_size_, 
+              std::min(this->d_size_, this->x_size_), temp_norm.getData(), true);
+          temp_norm.copyTo(&norm_w);
+          this->context_->synchronize();
+          printf("[LR-TT DIRECT] After transfer: ||W||_F = %.6e\n", (float)norm_w);
+        }
+      }  // end else (legacy path)
+    }  // end if (rank_ > 0 && par.transfer_lr != 0)
   }
   
   // 4. Reduce to aggregated weights
@@ -1732,7 +1576,7 @@ void LRTTTransferRPUDeviceCuda<T>::doLoRAPulsedUpdate_(
   if (rank_ > std::min(this->d_size_, this->x_size_)) {
     std::ostringstream ss;
     ss << "LR-TT: rank (" << rank_ << ") exceeds matrix dims d=" << this->d_size_ << ", x=" << this->x_size_;
-    RPU_FATAL(ss.str());
+    RPU_FATAL(ss.str().c_str());
   }
   auto up = up_in;
   enforceStochasticCompressed(up);

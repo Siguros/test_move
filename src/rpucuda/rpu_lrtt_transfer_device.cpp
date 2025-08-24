@@ -73,6 +73,11 @@ void LRTTTransferRPUDeviceMetaParameter<T>::initializeWithSize(int x_size, int d
     RPU_FATAL("Invalid update_rule in LRTT device (only LR_TT is supported)");
   }
   
+  // Validate transfer cadence for LR-TT
+  if (this->transfer_every <= 0) {
+    RPU_FATAL("LR-TT requires transfer_every > 0 to guarantee periodic transfer A@B -> visible");
+  }
+  
   // DEBUG: Log device indices and configuration
 #ifdef AIHWKIT_DEBUG_LRTT
   std::cout << "[LR-TT DEBUG] initializeWithSize:" << std::endl;

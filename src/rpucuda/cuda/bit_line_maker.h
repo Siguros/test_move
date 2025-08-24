@@ -97,6 +97,11 @@ public:
   // Return raw inputs (may be null if expose_raw_inputs_ == false)
   T* getRawXData() const { return dev_x_raw_ ? dev_x_raw_->getData() : nullptr; }
   T* getRawDData() const { return dev_d_raw_ ? dev_d_raw_->getData() : nullptr; }
+  
+  // Stable analog input API for LR-TT and other devices requiring guaranteed access
+  // These are aliases to getRawXData/getRawDData but with clearer semantic meaning
+  const T* getAnalogX() const { return getRawXData(); }  // [x_size, m_batch], col-major
+  const T* getAnalogD() const { return getRawDData(); }  // [d_size, m_batch], col-major
 
   // helper for debug
   void getCountsDebug(uint32_t *x_counts, uint32_t *d_counts);
