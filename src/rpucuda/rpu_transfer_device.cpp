@@ -181,13 +181,18 @@ void TransferRPUDeviceMetaParameter<T>::initializeWithSize(int x_size, int d_siz
   }
 
   if (transfer_every_vec.size() == 0) {
-    T n = transfer_every;
-    for (size_t i = 0; i < n_devices; i++) {
-      transfer_every_vec.push_back(n);
-      n *= (T)_out_size / (T)n_reads_per_transfer;
-    }
-    if (no_self_transfer) {
-      transfer_every_vec[n_devices - 1] = 0;
+    if (n_reads_per_transfer <= 0) {
+      // Explicitly disable scheduling if reads-per-transfer is zero/disabled
+      transfer_every_vec.assign(n_devices, (T)0.0);
+    } else {
+      T n = transfer_every;
+      for (size_t i = 0; i < n_devices; i++) {
+        transfer_every_vec.push_back(n);
+        n *= (T)_out_size / (T)n_reads_per_transfer;  // safe: n_reads_per_transfer > 0
+      }
+      if (no_self_transfer) {
+        transfer_every_vec[n_devices - 1] = 0;
+      }
     }
   }
 

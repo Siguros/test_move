@@ -20,17 +20,44 @@ namespace RPU {
 template <typename T>
 void LRTTTransferRPUDeviceMetaParameter<T>::initializeWithSize(int x_size, int d_size) {
   
-  // Call parent initialization
+  // --- Validate vector device count upfront
+  if (this->vec_par.size() != 3) {
+    RPU_FATAL("LRTTTransferRPUDevice requires exactly 3 devices: [fastA, fastB, visible]");
+  }
+  
+  // --- Validate visible must be the last device
+  const int ndev = (int)this->vec_par.size();
+  if (idx_visible != ndev - 1) {
+    RPU_FATAL("LR-TT requires 'visible' to be the last device (idx_visible == n_devices - 1).");
+  }
+  
+  // --- LR-TT disables parent read-based transfer altogether
+  this->n_reads_per_transfer = 0;
+  
+  // Disable parent chain scheduling explicitly (no-op transfers)
+  this->transfer_every_vec.assign(this->vec_par.size(), (T)0.0);
+  
+  // --- Force fully_hidden invariants
+  // Visible must be the last device so that fullyHidden() (which checks back()) matches visible
+  this->gamma_vec.assign(ndev, (T)0.0);
+  this->gamma_vec[idx_visible] = (T)1.0;  // Only visible contributes to network weight
+  
+  // Critical: make sure scalar 'gamma' becomes 0 so fullyHidden() => true
+  // (Parent will also set gamma = sum(gamma_vec[0..last-1]) == 0.)
+  this->gamma = (T)0.0;
+  
+  // --- Update policy for LR-TT (CUDA sequences A/B; base must not try multi-device updates)
+  this->update_policy = VectorDeviceUpdatePolicy::SingleFixed;
+  this->first_update_idx = idx_fastA;
+  this->same_context = true;
+  
+  // --- Now call the parent. It will validate sizes, confirm last gamma != 0,
+  //     set 'gamma' consistently (0), and keep transfer_every_vec as all zeros.
   TransferRPUDeviceMetaParameter<T>::initializeWithSize(x_size, d_size);
   
   // Backward compatibility: if desired_BL == 0 and desired_bl != 0, use desired_bl
   if (desired_BL == 0 && desired_bl != 0) {
     desired_BL = desired_bl;
-  }
-  
-  // Validate we have exactly 3 devices
-  if (this->vec_par.size() != 3) {
-    RPU_FATAL("LRTTTransferRPUDevice requires exactly 3 devices: [fastA, fastB, visible]");
   }
   
   // Validate rank if specified
@@ -46,17 +73,6 @@ void LRTTTransferRPUDeviceMetaParameter<T>::initializeWithSize(int x_size, int d
     RPU_FATAL("Invalid update_rule in LRTT device (only LR_TT is supported)");
   }
   
-  // Device layout validation will be done in the device constructor
-  // where we can check actual dimensions
-  
-  // Override some parent settings for LR-TT
-  // CRITICAL: Use SingleFixed update policy, not All
-  // The CUDA subclass handles A/B sequencing in runUpdateKernel
-  // Using All would trigger unsupported multi-device update in base class
-  this->update_policy = VectorDeviceUpdatePolicy::SingleFixed;
-  this->first_update_idx = idx_fastA;  // Start with fastA
-  this->same_context = true;
-  
   // DEBUG: Log device indices and configuration
 #ifdef AIHWKIT_DEBUG_LRTT
   std::cout << "[LR-TT DEBUG] initializeWithSize:" << std::endl;
@@ -66,25 +82,9 @@ void LRTTTransferRPUDeviceMetaParameter<T>::initializeWithSize(int x_size, int d
   std::cout << "  Device order: [fastA=" << idx_fastA << ", fastB=" << idx_fastB 
             << ", visible=" << idx_visible << "]" << std::endl;
   std::cout << "  update_policy=SingleFixed (CUDA handles A/B sequencing)" << std::endl;
-  std::cout << "  (Parent gamma_vec exists but is not used as LR-TT decay.)" << std::endl;
-  std::cout << "  Note: Fast A and B get gradients, visible only via transfer" << std::endl;
+  std::cout << "  fully_hidden mode: gamma=0, gamma_vec=[0,0,1]" << std::endl;
+  std::cout << "  n_reads_per_transfer=0, transfer_every_vec=[0,0,0]" << std::endl;
 #endif
-  
-  // Force disable parent's read-based transfer to prevent double accumulation
-  // LR-TT implements its own AB outer product transfer mechanism
-  if (this->n_reads_per_transfer != 0) {
-    RPU_WARNING("LRTT: n_reads_per_transfer must be 0, overriding user value");
-  }
-  this->n_reads_per_transfer = 0;        // no read slices by parent
-  
-  // Set gamma_vec for LR-TT: enable fast devices A and B, disable visible
-  // The visible device gets updates only through transfer, not direct gradient
-  if (this->gamma_vec.empty()) {
-    this->gamma_vec.assign(this->vec_par.size(), (T)0.0);
-    this->gamma_vec[idx_fastA] = (T)1.0;  // Enable fast A
-    this->gamma_vec[idx_fastB] = (T)1.0;  // Enable fast B  
-    this->gamma_vec[idx_visible] = (T)0.0;  // Disable visible (updated via transfer only)
-  }
 }
 
 template <typename T>
@@ -184,6 +184,11 @@ void LRTTTransferRPUDevice<T>::validateTopology() const {
       par.idx_visible == par.idx_fastB || 
       par.idx_fastA == par.idx_fastB) {
     RPU_FATAL("Device indices must be unique");
+  }
+  
+  // CRITICAL: Visible must be the last device for fully_hidden mode to work correctly
+  if (par.idx_visible != (int)this->rpu_device_vec_.size() - 1) {
+    RPU_FATAL("LR-TT expects 'visible' to be the last device (idx_visible == n_devices - 1).");
   }
   
   // For Step-1: Enforce equal shapes for simplicity
