@@ -15,6 +15,8 @@
 #include <memory>
 #include <utility>          // for std::swap
 #include <curand_kernel.h>  // for curandState_t
+#include <cstdio>           // for printf in inline functions
+#include <cstdlib>          // for std::getenv
 
 namespace RPU {
 
@@ -45,7 +47,7 @@ public:
   explicit LRTTTransferRPUDeviceCuda() {};
   explicit LRTTTransferRPUDeviceCuda(CudaContextPtr c, const LRTTTransferRPUDevice<T> &cpu_device);
   
-  ~LRTTTransferRPUDeviceCuda() = default;
+  ~LRTTTransferRPUDeviceCuda();
   
   // Copy/move constructors
   LRTTTransferRPUDeviceCuda(const LRTTTransferRPUDeviceCuda<T> &other);
@@ -80,6 +82,9 @@ public:
     swap(a.debug_no_host_copies_, b.debug_no_host_copies_);
     swap(a.dev_fb_out_, b.dev_fb_out_);
     swap(a.dev_y_ab_, b.dev_y_ab_);
+    swap(a.visible_synced_, b.visible_synced_);
+    swap(a.last_agg_ptr_, b.last_agg_ptr_);
+    swap(a.visible_sync_ev_, b.visible_sync_ev_);
   }
   
   // Get parameter
@@ -166,6 +171,12 @@ public:
   
   // Sync visible weights with aggregated weights (for setWeights)
   void syncVisibleWithAggregated(T* aggregated_weights, cudaStream_t stream = nullptr);
+  
+  // Bind the current aggregated weight buffer and mark visible as dirty
+  inline void bindAggregatedPointer(T* agg) {
+    last_agg_ptr_ = agg;        // remember which aggregated buffer we last saw
+    visible_synced_ = false;    // force next sync (or immediate sync by the caller)
+  }
   
   // Sub-tile access methods for debugging/inspection
   int getRank() const { return rank_; }
@@ -281,6 +292,24 @@ private:
   // Temporary buffers for analog forward-inject
   std::unique_ptr<CudaArray<T>> dev_fb_out_; // B*x full result [d_size * m_batch]
   std::unique_ptr<CudaArray<T>> dev_y_ab_;   // A*(B_lr*x)    [d_size * m_batch]
+  
+  // Fix A: Track visible weight sync state
+  bool visible_synced_ = false;
+  T* last_agg_ptr_ = nullptr;  // Last seen aggregated dev_weights buffer
+  
+  // Event for cross-stream synchronization of visible weight copies
+  cudaEvent_t visible_sync_ev_ = nullptr;
+  
+public:
+  // Helper to wait for visible sync completion on a consumer stream
+  inline void waitVisibleSyncOn(cudaStream_t consumer) {
+    if (visible_sync_ev_) {
+      if (std::getenv("AIHWKIT_DEBUG_LRTT")) {
+        printf("[DEBUG] waiting on visible-sync event from stream %p\n", consumer);
+      }
+      CUDA_CALL(cudaStreamWaitEvent(consumer, visible_sync_ev_, 0));
+    }
+  }
 };
 
 } // namespace RPU

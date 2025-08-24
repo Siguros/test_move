@@ -435,6 +435,14 @@ template <typename T> void RPUCudaPulsed<T>::setWeightsReal(const T *weightsptr,
   DEBUG_OUT("Finished setting weights real [avg deviation=" << avg_dev << "]");
 
   Array_2D_Free<T>(eye);
+  
+  // Sync visible weights for LRTT device after iterative weight setting
+  T* aggregated_weights = this->dev_weights_ ? this->dev_weights_->getData() : nullptr;
+  auto *lrtt = dynamic_cast<LRTTTransferRPUDeviceCuda<T>*>(rpucuda_device_.get());
+  if (lrtt && aggregated_weights) {
+    lrtt->bindAggregatedPointer(aggregated_weights);
+    lrtt->syncVisibleWithAggregated(aggregated_weights, this->context_->getStream());
+  }
 }
 
 template <typename T>
@@ -466,6 +474,14 @@ template <typename T> void RPUCudaPulsed<T>::setDeviceParameter(const std::vecto
 
   // set device weights which might have been updated because of the hidden parameters
   RPUCudaSimple<T>::setWeights(this->getWeightsPtr()[0]);
+  
+  // Sync visible weights for LRTT device after setting device parameters
+  T* aggregated_weights = this->dev_weights_ ? this->dev_weights_->getData() : nullptr;
+  auto *lrtt = dynamic_cast<LRTTTransferRPUDeviceCuda<T>*>(rpucuda_device_.get());
+  if (lrtt && aggregated_weights) {
+    lrtt->bindAggregatedPointer(aggregated_weights);
+    lrtt->syncVisibleWithAggregated(aggregated_weights, this->context_->getStream());
+  }
 };
 
 template <typename T> int RPUCudaPulsed<T>::getHiddenUpdateIdx() const {
@@ -537,11 +553,13 @@ template <typename T> void RPUCudaPulsed<T>::setWeights(const T *host_source) {
   
   // Sync visible weights for LRTT device
   auto *lrtt = dynamic_cast<LRTTTransferRPUDeviceCuda<T>*>(rpucuda_device_.get());
-  if (lrtt) {
+  if (lrtt && aggregated_weights) {
     if (std::getenv("AIHWKIT_DEBUG_LRTT")) {
-      printf("[DEBUG] Syncing visible weights for top-level LRTT device\n");
+      printf("[DEBUG] Binding and syncing visible weights for top-level LRTT device\n");
     }
-    lrtt->syncVisibleWithAggregated(aggregated_weights);
+    // Bind the aggregated pointer and immediately sync
+    lrtt->bindAggregatedPointer(aggregated_weights);
+    lrtt->syncVisibleWithAggregated(aggregated_weights, this->context_->getStream());
   } else {
     // Check if Vector contains nested LRTT
     auto *vec = dynamic_cast<VectorRPUDeviceCuda<T>*>(rpucuda_device_.get());
@@ -591,12 +609,13 @@ template <typename T> void RPUCudaPulsed<T>::setWeights(const T *host_source) {
         }
       }
       
-      if (perform_nested_sync) {
+      if (perform_nested_sync && aggregated_weights) {
         if (std::getenv("AIHWKIT_DEBUG_LRTT")) {
-          printf("[DEBUG] Copying visible weights from aggregated for nested LRTT device\n");
+          printf("[DEBUG] Binding and syncing visible weights for nested LRTT device\n");
         }
-        // Use copyVisibleWeightsFrom to avoid relying on pointer identity
-        found_lrtt->copyVisibleWeightsFrom(aggregated_weights);
+        // Bind the aggregated pointer and immediately sync
+        found_lrtt->bindAggregatedPointer(aggregated_weights);
+        found_lrtt->syncVisibleWithAggregated(aggregated_weights, this->context_->getStream());
       } else {
         // Skip nested sync and log debug message
         if (std::getenv("AIHWKIT_DEBUG_LRTT")) {

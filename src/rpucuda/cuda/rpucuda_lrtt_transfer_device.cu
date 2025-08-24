@@ -27,38 +27,55 @@ namespace RPU {
 // Sync visible weights with aggregated weights implementation
 template <typename T>
 void LRTTTransferRPUDeviceCuda<T>::syncVisibleWithAggregated(T* aggregated, cudaStream_t stream) {
+  // Early exit if no aggregated buffer provided
+  if (!aggregated) {
+    return;
+  }
+  
+  // Initialize device pointers if needed
   if (!dev_w_visible_) {
     if (std::getenv("AIHWKIT_DEBUG_LRTT")) {
       printf("[DEBUG] syncVisibleWithAggregated: initializing device pointers\n");
     }
     initializeDevicePointers();
+    if (!dev_w_visible_) {
+      return;  // Still no visible pointer after init
+    }
   }
   
-  if (!aggregated || !dev_w_visible_) {
-    if (std::getenv("AIHWKIT_DEBUG_LRTT")) {
-      printf("[DEBUG] syncVisibleWithAggregated: SKIPPED (visible=%p, aggregated=%p)\n",
-             dev_w_visible_, aggregated);
-    }
-    return;
-  }
+  cudaStream_t s = stream ? stream : this->context_->getStream();
+  size_t bytes = sizeof(T) * this->d_size_ * this->x_size_;
+  bool same_ptr = (dev_w_visible_ == aggregated);
   
-  if (dev_w_visible_ != aggregated) {
-    // Weight layout is column-major [d, x], stride [1, d]
-    const int d = this->d_size_;
-    const int x = this->x_size_;
+  // Perform copy if needed
+  if (!same_ptr) {
     if (std::getenv("AIHWKIT_DEBUG_LRTT")) {
-      printf("[DEBUG] syncVisibleWithAggregated: copying %d weights from %p to %p\n",
-             d * x, aggregated, dev_w_visible_);
+      printf("[DEBUG] syncVisibleWithAggregated: memcpy %zu bytes from %p to %p on stream %p\n",
+             bytes, aggregated, dev_w_visible_, s);
     }
-    RPU::math::copy<T>(
-      this->context_, d * x,
-      aggregated, 1, dev_w_visible_, 1);
+    CUDA_CALL(cudaMemcpyAsync(dev_w_visible_, aggregated, bytes, cudaMemcpyDeviceToDevice, s));
   } else {
     if (std::getenv("AIHWKIT_DEBUG_LRTT")) {
-      printf("[DEBUG] syncVisibleWithAggregated: SKIPPED (visible=%p, aggregated=%p, same=1)\n",
-             dev_w_visible_, aggregated);
+      printf("[DEBUG] syncVisibleWithAggregated: same pointer, no copy, stream %p\n", s);
     }
   }
+  
+  // Create event lazily if needed
+  if (!visible_sync_ev_) {
+    CUDA_CALL(cudaEventCreateWithFlags(&visible_sync_ev_, cudaEventDisableTiming));
+  }
+  
+  // Record completion event for consumers to wait on
+  CUDA_CALL(cudaEventRecord(visible_sync_ev_, s));
+  
+  if (std::getenv("AIHWKIT_DEBUG_LRTT")) {
+    printf("[DEBUG] visible-sync event recorded on stream %p (bytes=%zu, same_ptr=%d)\n",
+           s, bytes, same_ptr);
+  }
+  
+  // Mark as synced (now means "event recorded", not necessarily finished on other streams)
+  last_agg_ptr_ = aggregated;
+  visible_synced_ = true;
 }
 
 // CUDA kernel for resetting weights to zero
@@ -189,6 +206,25 @@ __global__ void kernelZeroFirstKRows(T* W, int d, int x_size, int K) {
   int col = i / K;       // 0..x_size-1
   int idx = row + col * d;  // col-major indexing
   W[idx] = (T)0.0;
+}
+
+// Stateless Kaiming Normal for first K rows (fill B_lr = B[:K, :])
+template <typename T>
+__global__ void kernelKaimingInitFirstKRowsStateless(
+    T* W, int d, int x_size, int K, unsigned long long seed, T std) {
+  // W is [d, x_size] col-major. We fill rows 0..K-1 across all columns.
+  int i = blockDim.x * blockIdx.x + threadIdx.x; // 0..(K*x_size-1)
+  int n = K * x_size;
+  if (i >= n) return;
+  int row = i % K;         // 0..K-1
+  int col = i / K;         // 0..x_size-1
+  int idx = row + col * d; // col-major index
+
+  curandStatePhilox4_32_10_t rng;
+  curand_init(seed, static_cast<unsigned long long>(i), 0ULL, &rng);
+
+  T z = (T)curand_normal(&rng) * std;
+  W[idx] = z;
 }
 
 // ---- LoRA update kernels ----
@@ -530,6 +566,10 @@ LRTTTransferRPUDeviceCuda<T>::LRTTTransferRPUDeviceCuda(
   num_transfers_ = 0;
   debug_no_host_copies_ = 0;
   
+  // Fix A: Reset sync state
+  visible_synced_ = false;
+  last_agg_ptr_ = nullptr;
+  
   // Initialize after devices are created
   initializeDevicePointers();
   
@@ -593,6 +633,16 @@ LRTTTransferRPUDeviceCuda<T>::LRTTTransferRPUDeviceCuda(
   c->synchronize();
 }
 
+// Destructor
+template <typename T>
+LRTTTransferRPUDeviceCuda<T>::~LRTTTransferRPUDeviceCuda() {
+  if (visible_sync_ev_) {
+    cudaEventDestroy(visible_sync_ev_);
+    visible_sync_ev_ = nullptr;
+  }
+}
+
+// Copy constructor
 template <typename T>
 LRTTTransferRPUDeviceCuda<T>::LRTTTransferRPUDeviceCuda(
     const LRTTTransferRPUDeviceCuda<T> &other)
@@ -602,7 +652,10 @@ LRTTTransferRPUDeviceCuda<T>::LRTTTransferRPUDeviceCuda(
       num_a_updates_(0),
       num_b_updates_(0),
       num_transfers_(0),
-      debug_no_host_copies_(0) {
+      debug_no_host_copies_(0),
+      visible_synced_(false),  // Force re-sync on first use after copy
+      last_agg_ptr_(nullptr),
+      visible_sync_ev_(nullptr) {  // Never copy event handles
   
   // Re-allocate temporary buffers
   if (other.dev_temp_x_) {
@@ -655,6 +708,14 @@ LRTTTransferRPUDeviceCuda<T>::operator=(const LRTTTransferRPUDeviceCuda<T> &othe
     num_b_updates_ = 0;
     num_transfers_ = 0;
     debug_no_host_copies_ = 0;
+    
+    // Destroy existing event if any
+    if (visible_sync_ev_) {
+      cudaEventDestroy(visible_sync_ev_);
+    }
+    visible_sync_ev_ = nullptr;  // Never copy event handles
+    visible_synced_ = false;     // Force re-sync on first use
+    last_agg_ptr_ = nullptr;
     
     if (other.dev_temp_x_) {
       dev_temp_x_ = RPU::make_unique<CudaArray<T>>(*other.dev_temp_x_);
@@ -722,12 +783,16 @@ LRTTTransferRPUDeviceCuda<T>::LRTTTransferRPUDeviceCuda(
       num_transfers_(other.num_transfers_),
       debug_no_host_copies_(other.debug_no_host_copies_),
       dev_fb_out_(std::move(other.dev_fb_out_)),
-      dev_y_ab_(std::move(other.dev_y_ab_)) {
+      dev_y_ab_(std::move(other.dev_y_ab_)),
+      visible_synced_(other.visible_synced_),
+      last_agg_ptr_(other.last_agg_ptr_),
+      visible_sync_ev_(other.visible_sync_ev_) {  // Transfer event handle
   
   other.dev_w_visible_ = nullptr;
   other.dev_w_a_ = nullptr;
   other.dev_w_b_ = nullptr;
   other.scratch_mb_capacity_ = 0;
+  other.visible_sync_ev_ = nullptr;  // Clear moved-from event
 }
 
 template <typename T>
@@ -759,10 +824,19 @@ LRTTTransferRPUDeviceCuda<T>::operator=(LRTTTransferRPUDeviceCuda<T> &&other) no
     dev_fb_out_ = std::move(other.dev_fb_out_);
     dev_y_ab_ = std::move(other.dev_y_ab_);
     
+    // Destroy existing event if any, then transfer the handle
+    if (visible_sync_ev_) {
+      cudaEventDestroy(visible_sync_ev_);
+    }
+    visible_sync_ev_ = other.visible_sync_ev_;
+    visible_synced_ = other.visible_synced_;
+    last_agg_ptr_ = other.last_agg_ptr_;
+    
     other.dev_w_visible_ = nullptr;
     other.dev_w_a_ = nullptr;
     other.dev_w_b_ = nullptr;
     other.scratch_mb_capacity_ = 0;
+    other.visible_sync_ev_ = nullptr;  // Clear moved-from event
   }
   return *this;
 }
@@ -788,6 +862,10 @@ void LRTTTransferRPUDeviceCuda<T>::populateFrom(const AbstractRPUDevice<T> &rpu_
   
   // Initialize device pointers
   initializeDevicePointers();
+  
+  // Fix A: Reset sync state
+  visible_synced_ = false;
+  last_agg_ptr_ = nullptr;
   
   // Re-initialize PWUs after population if needed
   if (rank_ > 0 && this->rpucuda_device_vec_.size() >= 3) {
@@ -823,15 +901,16 @@ void LRTTTransferRPUDeviceCuda<T>::populateFrom(const AbstractRPUDevice<T> &rpu_
   const auto& par = getPar();
   if (par.update_rule == LRUpdateRule::LR_TT) {
     if (par.transfer_every <= 0) {
-      RPU_FATAL("LR-TT requires transfer_every > 0 to guarantee periodic transfer A@B -> visible. "
-                "Current value: " << par.transfer_every);
+      RPU_WARNING("LR-TT: transfer_every <= 0 disables periodic transfers. "
+                  "This is acceptable for inference-only scenarios but breaks the "
+                  "'always pulsed' guarantee during training. Current value: " << par.transfer_every);
     }
     if (par.n_reads_per_transfer > 0) {
       RPU_FATAL("LR-TT requires n_reads_per_transfer == 0 (parent read-based transfer is disabled). "
                 "Current value: " << par.n_reads_per_transfer);
     }
     if (getenv("AIHWKIT_DEBUG_LRTT")) {
-      printf("[LR-TT CUDA] Transfer validation passed: transfer_every=%d, n_reads_per_transfer=%d\n",
+      printf("[LR-TT CUDA] Transfer validation: transfer_every=%d, n_reads_per_transfer=%d\n",
              par.transfer_every, par.n_reads_per_transfer);
     }
   }
@@ -865,6 +944,9 @@ void LRTTTransferRPUDeviceCuda<T>::initializeDevicePointers() {
     // Get pointers from the pre-computed array
     if (par.idx_visible >= 0 && par.idx_visible < (int)this->dev_weights_ptrs_.size()) {
       dev_w_visible_ = this->dev_weights_ptrs_[par.idx_visible];
+      // CRITICAL: Ensure the pointer array always reflects our current visible pointer
+      // This is needed for reduceToWeights to work correctly after transfer
+      this->dev_weights_ptrs_[par.idx_visible] = dev_w_visible_;
     }
     
     if (par.idx_fastA >= 0 && par.idx_fastA < (int)this->dev_weights_ptrs_.size()) {
@@ -921,10 +1003,19 @@ void LRTTTransferRPUDeviceCuda<T>::runUpdateKernel(
     RPU_FATAL("LRTTTransferRPUDeviceCuda requires rank > 0");
   }
   
-  // Handle fully hidden case
+  // Handle fully hidden case FIRST (before sync)
   if (this->fully_hidden_) {
     this->dev_weights_ptrs_[par.idx_visible] = dev_weights;
     dev_w_visible_ = dev_weights;  // Ensure consistent buffer usage in transfer path
+  }
+  
+  // Fix A: One-time sync of visible tile from aggregated layer weights
+  // Must be done AFTER fully_hidden pointer update
+  if (!visible_synced_ || last_agg_ptr_ != dev_weights) {
+    cudaStream_t stream = up_context ? up_context->getStream() : this->context_->getStream();
+    syncVisibleWithAggregated(dev_weights, stream);
+    last_agg_ptr_ = dev_weights;
+    visible_synced_ = true;
   }
   
   // Ensure device pointers are initialized (good safety check)
@@ -1005,6 +1096,10 @@ void LRTTTransferRPUDeviceCuda<T>::runUpdateKernel(
       num_transfers_++;  // Increment transfer counter
     }
     
+    // Wait for any pending visible sync before reducing to aggregated weights
+    cudaStream_t reduce_stream = up_context ? up_context->getStream() : this->context_->getStream();
+    waitVisibleSyncOn(reduce_stream);
+    
     // Reduce to aggregated weights
     this->reduceToWeights(up_context, dev_weights);
   }  // End of LR-TT pulsed path block
@@ -1046,6 +1141,17 @@ void LRTTTransferRPUDeviceCuda<T>::applyABOuterAsPulsedUpdate(T lr_scale, cudaSt
   ensureABScratch_(); // Ensure dev_temp_d_ and dev_temp_x_ are allocated
 
   cudaStream_t s = stream ? stream : this->context_->getStream();
+  cudaStream_t ctx_s = this->context_->getStream();
+  const bool cross_stream = (ctx_s != s);
+  
+  // Fix B: Create events for stream synchronization
+  cudaEvent_t ev_pack_done = nullptr;
+  cudaEvent_t ev_update_done = nullptr;
+  if (cross_stream) {
+    CUDA_CALL(cudaEventCreateWithFlags(&ev_pack_done, cudaEventDisableTiming));
+    CUDA_CALL(cudaEventCreateWithFlags(&ev_update_done, cudaEventDisableTiming));
+  }
+  
   if (!visible_pwu_) visible_pwu_ = std::make_unique<PulsedWeightUpdater<T>>(this->context_, this->x_size_, this->d_size_);
 
   PulsedUpdateMetaParameter<T> up;
@@ -1063,8 +1169,17 @@ void LRTTTransferRPUDeviceCuda<T>::applyABOuterAsPulsedUpdate(T lr_scale, cudaSt
     ss << "LR-TT transfer requires pulsed visible tile (idx_visible=" << par.idx_visible << ").";
     RPU_FATAL(ss.str().c_str());
   }
+  
+  // CRITICAL: The visible device might have restrictive dw_min that prevents updates
+  // We need to ensure the device allows updates with the transfer learning rate
+  // Check if devVis has appropriate parameters for transfer
 
-  const T lr_eff = -lr_scale; // PWU computes -lr * D * X^T
+  // PWU computes: W += -lr * D @ X^T
+  // We want: W += transfer_lr * A @ B
+  // We pass D = A_chunk, X = B_chunk^T
+  // So PWU computes: W += -lr * A_chunk @ B_chunk
+  // To get W += transfer_lr * A_chunk @ B_chunk, we need lr = -transfer_lr
+  const T lr_eff = -lr_scale;
 
   if (getenv("AIHWKIT_DEBUG_LRTT")) {
     printf("[LR-TT] applyABOuterAsPulsedUpdate: K=%d, chunk=%d, lr_scale=%.6e, lr_eff=%.6e\n", 
@@ -1084,7 +1199,7 @@ void LRTTTransferRPUDeviceCuda<T>::applyABOuterAsPulsedUpdate(T lr_scale, cudaSt
     kernelPackColsWithOffset<<<(nD + threads - 1)/threads, threads, 0, s>>>(
         dev_temp_d_->getData(), dev_w_a_, this->d_size_, this->x_size_, cur, off);
 
-    // X_chunk^T = B[off:off+cur, :] -> dev_temp_x_ [cur × x]
+    // Pack B_chunk = B[off:off+cur, :] -> dev_temp_x_ [cur × x]
     const int nX = cur * this->x_size_;
     kernelPackRowsWithOffset<<<(nX + threads - 1)/threads, threads, 0, s>>>(
         dev_temp_x_->getData(), dev_w_b_, this->d_size_, this->x_size_, cur, off);
@@ -1094,11 +1209,20 @@ void LRTTTransferRPUDeviceCuda<T>::applyABOuterAsPulsedUpdate(T lr_scale, cudaSt
       dev_temp_x_T_ = std::make_unique<CudaArray<T>>(this->context_, this->x_size_ * chunk);
     }
 
-    // Transpose dev_temp_x_ from [cur × x] to dev_temp_x_T_ [x × cur]
+    // Transpose B_chunk from [cur × x] to B_chunk^T [x × cur] for PWU
     kernelTransposeKxXtoXxK<<<(nX + threads - 1)/threads, threads, 0, s>>>(
         dev_temp_x_T_->getData(),
         dev_temp_x_->getData(),
         cur, this->x_size_);
+
+    // Fix B: Ensure PWU (on ctx_s) only starts after pack/transpose on 's' has completed
+    if (cross_stream) {
+      CUDA_CALL(cudaEventRecord(ev_pack_done, s));
+      CUDA_CALL(cudaStreamWaitEvent(ctx_s, ev_pack_done, 0));
+    }
+    
+    // Wait for any pending visible sync before updating visible weights
+    waitVisibleSyncOn(ctx_s);
 
     // Call updater safely with x_trans=false, d_trans=false
     visible_pwu_->update(
@@ -1106,45 +1230,62 @@ void LRTTTransferRPUDeviceCuda<T>::applyABOuterAsPulsedUpdate(T lr_scale, cudaSt
         /*D=*/dev_temp_d_->getData(),   // [d × cur] col-major (correct layout)
         dev_w_visible_, devVis, up, lr_eff, /*m_batch=*/cur,
         /*x_trans=*/false, /*d_trans=*/false);
+    
+    // Fix B: Reinit (on 's') must wait until the PWU update on ctx_s has finished
+    if (cross_stream) {
+      CUDA_CALL(cudaEventRecord(ev_update_done, ctx_s));
+      CUDA_CALL(cudaStreamWaitEvent(s, ev_update_done, 0));
+    }
   }
 
   reinitFastTiles(s);
+  
+  // Fix B: Clean up events
+  if (cross_stream) {
+    CUDA_CALL(cudaEventDestroy(ev_pack_done));
+    CUDA_CALL(cudaEventDestroy(ev_update_done));
+  }
 }
 
 template <typename T>
 void LRTTTransferRPUDeviceCuda<T>::reinitFastTiles(cudaStream_t stream) {
   const int K = rank_;
   if (K <= 0) return;
-  
+
   cudaStream_t s = stream ? stream : this->context_->getStream();
   const int threads = 256;
-  
+  const int d = this->d_size_;
+  const int x = this->x_size_;
+
   if (getenv("AIHWKIT_DEBUG_LRTT")) {
-    printf("[LR-TT] reinitFastTiles: K=%d, reinit_gain=%.6e\n", K, getPar().reinit_gain);
+    printf("[LR-TT] reinitFastTiles (LoRA-convention mapping): K=%d\n", K);
+    printf("       -> A_lr = 0 (first K cols of A),  B_lr ~ Kaiming (first K rows of B)\n");
   }
-  
-  // A: Kaiming(He) normal initialization for first K columns
-  const int nA = this->d_size_ * K;
-  const int blocks_A = (nA + threads - 1) / threads;
-  
-  // Generate seed for stateless RNG - combine device pointer, counter, and random value
-  // This ensures different initialization each time reinit is called
+
+  // --- Zero A entirely (safe & simple) -> ensures A_lr == 0
+  const int nA_full = d * x;
+  const int blocks_A_full = (nA_full + threads - 1) / threads;
+  kernelResetWeights<<<blocks_A_full, threads, 0, s>>>(dev_w_a_, nA_full);
+
+  // --- Zero B entirely first (so rows beyond K stay clean)
+  const int nB_full = d * x;
+  const int blocks_B_full = (nB_full + threads - 1) / threads;
+  kernelResetWeights<<<blocks_B_full, threads, 0, s>>>(dev_w_b_, nB_full);
+
+  // --- Kaiming(He) init for B_lr = first K rows of B
+  // Fan-in for a row-wise linear map B_lr (K×x) applied to X (x×mb) is 'x'.
   static unsigned long long reinit_counter = 0;
   reinit_counter++;
-  unsigned long long seed = ((unsigned long long)(uintptr_t)dev_w_a_ ^ reinit_counter) + 
-                            (unsigned long long)std::rand();
-  
-  // Calculate Kaiming standard deviation: gain * sqrt(2/fan_in)
-  const T std_dev = getPar().reinit_gain * std::sqrt((T)2.0 / (T)this->d_size_);
-  
-  // Use stateless kernel - no external curand states needed
-  kernelKaimingInitFirstKColsStateless<<<blocks_A, threads, 0, s>>>(
-    dev_w_a_, this->d_size_, this->x_size_, K, seed, std_dev);
-  
-  // B: all zeros over entire matrix
-  const int full_size = this->d_size_ * this->x_size_;
-  const int blocks_B = (full_size + threads - 1) / threads;
-  kernelResetWeights<<<blocks_B, threads, 0, s>>>(dev_w_b_, full_size);
+  unsigned long long seed =
+      ((unsigned long long)(uintptr_t)dev_w_b_ ^ reinit_counter) +
+      (unsigned long long)std::rand();
+
+  const T std_dev_B = getPar().reinit_gain * std::sqrt((T)2.0 / (T)x);
+
+  const int nB_lr = K * x;
+  const int blocks_B_lr = (nB_lr + threads - 1) / threads;
+  kernelKaimingInitFirstKRowsStateless<<<blocks_B_lr, threads, 0, s>>>(
+      dev_w_b_, d, x, K, seed, std_dev_B);
 }
 
 template <typename T>
@@ -1178,11 +1319,19 @@ void LRTTTransferRPUDeviceCuda<T>::doDirectUpdate(
     T *x_buffer,
     T *d_buffer) {
   
-  // Handle fully hidden case
+  // Handle fully hidden case FIRST (before sync)
   if (this->fully_hidden_) {
     const auto& par = this->getPar();
     this->dev_weights_ptrs_[par.idx_visible] = dev_weights;
     dev_w_visible_ = dev_weights;  // Ensure consistent buffer usage in transfer path
+  }
+  
+  // Fix A: One-time sync of visible tile from aggregated layer weights
+  // Must be done AFTER fully_hidden pointer update
+  if (!visible_synced_ || last_agg_ptr_ != dev_weights) {
+    syncVisibleWithAggregated(dev_weights, this->context_->getStream());
+    last_agg_ptr_ = dev_weights;
+    visible_synced_ = true;
   }
   
   // Ensure device pointers are initialized
@@ -1341,7 +1490,10 @@ void LRTTTransferRPUDeviceCuda<T>::doDirectUpdate(
     }  // end if (rank_ > 0 && par.transfer_lr != 0)
   }
   
-  // 4. Reduce to aggregated weights
+  // 4. Wait for any pending visible sync before reducing to aggregated weights
+  waitVisibleSyncOn(this->context_->getStream());
+  
+  // 5. Reduce to aggregated weights
   this->reduceToWeights(this->context_, dev_weights);
 }
 
@@ -1582,6 +1734,10 @@ void LRTTTransferRPUDeviceCuda<T>::doLoRAPulsedUpdate_(
   enforceStochasticCompressed(up);
 
   cudaStream_t s = up_context ? up_context->getStream() : this->context_->getStream();
+  
+  // Make sure all math/pwu ops run on the same stream as the pack/route kernels
+  CudaStreamGuard guard(this->context_, s);
+  
   const int K = rank_;
   const int threads = 256;
 
@@ -1719,7 +1875,20 @@ void LRTTTransferRPUDeviceCuda<T>::composeForwardInject(
     }
   }
 
-  cudaStream_t s = stream ? stream : this->context_->getStream();
+  // Force single stream to avoid races between pack kernels and GEMM
+  cudaStream_t s = this->context_->getStream();
+  
+  // Wait for any pending visible sync from another stream
+  waitVisibleSyncOn(s);
+  
+  // Use stream guard to ensure all operations (including GEMM) use the same stream
+  CudaStreamGuard guard(this->context_, s);
+  
+  // Fix A: Ensure visible weights are synced on first forward
+  if (!visible_synced_ && last_agg_ptr_) {
+    syncVisibleWithAggregated(last_agg_ptr_, s);
+    visible_synced_ = true;
+  }
   const int d = this->d_size_;
   const int x = this->x_size_;
   const int K = rank_;
@@ -1809,6 +1978,22 @@ bool LRTTTransferRPUDeviceCuda<T>::forwardWithAnalogInject(
     return fb.finalizeOutputPublic(out_values, iom, mv_pars, out_trans, transposed);
   }
 
+  // Ensure device pointers are initialized
+  if (!dev_w_visible_ || !dev_w_a_ || !dev_w_b_) {
+    initializeDevicePointers();
+  }
+  
+  // Fix A: Ensure visible weights are synced on first forward
+  cudaStream_t s = this->context_->getStream();
+  
+  // Wait for any pending visible sync from another stream
+  waitVisibleSyncOn(s);
+  
+  if (!visible_synced_ && last_agg_ptr_) {
+    syncVisibleWithAggregated(last_agg_ptr_, s);
+    visible_synced_ = true;
+  }
+  
   const int mb = iom.getMBatch();
   ensurePaddedBuffers(mb);   // provides dev_x_pad_
   ensureScratchBuffers(mb);  // provides dev_xb_mb_ (rank×mb)
