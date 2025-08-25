@@ -1,0 +1,121 @@
+# AIHWKit v0.9.0 - CUDA A100 Optimized Build
+
+This release contains a custom-built AIHWKit wheel optimized specifically for NVIDIA A100 GPUs (compute capability 8.0).
+
+## 🚀 Features
+
+- **CUDA-enabled** AIHWKit with full GPU acceleration
+- **A100-optimized** compilation (compute capability 8.0 only)
+- **LR-TT (Low-Rank Tensor Transfer)** functionality with latest modifications
+- **PyTorch 2.3** compatibility
+- **Python 3.10** support
+
+## 📋 Requirements
+
+- NVIDIA A100 GPU (compute capability 8.0)
+- Python 3.10
+- PyTorch 2.3.x with CUDA 11.8
+- CUDA Toolkit 11.8 or later
+
+## 💾 Installation
+
+### Option 1: Direct Installation from Release
+```bash
+# Download and install the wheel directly
+pip install https://github.com/nmdlkg/ml/releases/download/v0.9.0-cuda-a100/aihwkit-0.9.0-cp310-cp310-linux_x86_64.whl
+```
+
+### Option 2: Download and Install Locally
+```bash
+# Download the wheel file
+wget https://github.com/nmdlkg/ml/releases/download/v0.9.0-cuda-a100/aihwkit-0.9.0-cp310-cp310-linux_x86_64.whl
+
+# Install the wheel
+pip install aihwkit-0.9.0-cp310-cp310-linux_x86_64.whl
+```
+
+### Option 3: Using conda environment (recommended)
+```bash
+# Create or activate conda environment with Python 3.10
+conda create -n ml python=3.10
+conda activate ml
+
+# Install PyTorch 2.3 with CUDA 11.8
+pip install torch==2.3.1+cu118 torchvision==0.18.1+cu118 --index-url https://download.pytorch.org/whl/cu118
+
+# Install AIHWKit from this release
+pip install https://github.com/nmdlkg/ml/releases/download/v0.9.0-cuda-a100/aihwkit-0.9.0-cp310-cp310-linux_x86_64.whl
+```
+
+## ✅ Verification
+
+After installation, verify CUDA support:
+
+```python
+import aihwkit
+from aihwkit.simulator import rpu_base
+
+print(f"AIHWKit version: {aihwkit.__version__}")
+print(f"CUDA compiled: {rpu_base.cuda.is_compiled()}")
+```
+
+## 🧪 LR-TT Example
+
+```python
+import torch
+from aihwkit.nn import AnalogLinear
+from aihwkit.simulator.configs import SingleRPUConfig, TransferCompound
+from aihwkit.simulator.presets.devices import IdealizedPresetDevice
+from aihwkit.algorithms.lr_tt import LRTransferHook
+
+# Create transfer device configuration
+rpu_config = SingleRPUConfig(
+    device=TransferCompound(
+        unit_cell_devices=[IdealizedPresetDevice(), IdealizedPresetDevice()]
+    )
+)
+
+# Create analog layer
+layer = AnalogLinear(in_features=128, out_features=64, rpu_config=rpu_config)
+if torch.cuda.is_available():
+    layer = layer.cuda()
+
+# Set up LR-TT transfer hook
+hook = LRTransferHook(
+    modules_or_tiles=[layer],
+    rank=16,
+    transfer_every=100
+)
+
+# Your training loop here...
+```
+
+## 📊 Build Information
+
+- **Built on**: August 25, 2025
+- **Compiler**: NVCC with GCC
+- **CUDA Architecture**: compute_80 (A100 only)
+- **PyTorch**: 2.3.1+cu118
+- **Python**: 3.10.18
+- **Wheel size**: ~173MB
+
+## ⚠️ Important Notes
+
+1. This wheel is **A100-specific** and will not work on other GPU architectures
+2. Requires **exact Python 3.10** - other Python versions are not supported
+3. Built with **PyTorch 2.3** - ensure compatibility with your environment
+4. Contains **latest LR-TT CUDA modifications** as of build date
+
+## 🛠️ Troubleshooting
+
+If you encounter issues:
+
+1. Verify you have an A100 GPU: `nvidia-smi`
+2. Check Python version: `python --version` (should be 3.10.x)
+3. Verify PyTorch CUDA: `python -c "import torch; print(torch.cuda.is_available())"`
+4. Check CUDA compute capability: `python -c "import torch; print(torch.cuda.get_device_properties(0).major, torch.cuda.get_device_properties(0).minor)"` (should be 8.0)
+
+---
+
+**Maintainer**: Siguors (duddns157@snu.ac.kr)  
+**Repository**: https://github.com/nmdlkg/ml

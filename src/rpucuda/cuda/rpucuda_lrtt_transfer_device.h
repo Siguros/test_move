@@ -199,6 +199,7 @@ protected:
   
   // Transfer helpers
   void applyABOuterAsPulsedUpdate(T lr_scale, cudaStream_t stream);
+  void applyABOuterAsDigitalUpdate(T lr_scale, cudaStream_t stream);
   void reinitFastTiles(cudaStream_t stream);
   
   // Get device weight pointers from child devices

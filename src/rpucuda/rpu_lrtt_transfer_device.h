@@ -58,15 +58,29 @@ struct LRTTTransferRPUDeviceMetaParameter : public TransferRPUDeviceMetaParamete
   bool swap_xd = false;     // Swap X/D for update contract
   T transfer_lr = (T)1.0;   // Learning rate for transfer
   
-  // BL (bound level) controls for PWU
-  bool use_bl_management = false;  // Enable BL management in PWU
-  T desired_BL = (T)0.0;  // Desired bound level (0 = use device default)
-  T desired_bl = (T)0.0;  // deprecated alias for backward compatibility
+  // A/B training update BL management controls
+  bool ab_use_bl_management = true;  // Enable BL management for A/B updates (default: true for backward compat)
+  bool ab_use_update_management = true;  // Enable update management for A/B updates
+  T ab_desired_bl = (T)-1.0;  // Desired bound level for A/B updates (-1 = no override, use device default)
+  
+  // Transfer step BL management controls (A@B -> visible)
+  bool transfer_use_bl_management = false;  // Enable BL management for transfer (default: false for linear scaling)
+  bool transfer_use_update_management = false;  // Enable update management for transfer
+  T transfer_desired_bl = (T)-1.0;  // Desired bound level for transfer (-1 = no override)
+  bool transfer_digital_bypass = false;  // Bypass pulsed updates for transfer (use digital GEMM)
+  
+  // Legacy BL controls (deprecated, mapped to ab_* parameters for backward compatibility)
+  bool use_bl_management = false;  // DEPRECATED: Use ab_use_bl_management instead
+  T desired_BL = (T)0.0;  // DEPRECATED: Use ab_desired_bl instead
+  T desired_bl = (T)0.0;  // DEPRECATED: alias for backward compatibility
   
   // Reinit-after-transfer (only option that remains)
   T reinit_gain = (T)1.0;  // Gain for Kaiming(He) normal on A; B is zero-initialized.
   
-  LRTTTransferRPUDeviceMetaParameter() {};
+  LRTTTransferRPUDeviceMetaParameter() {
+    // Constructor will be called after member initialization,
+    // backward compatibility will be handled in initializeWithSize
+  }
   
   LRTTTransferRPUDeviceMetaParameter(
       const PulsedRPUDeviceMetaParameterBase<T> &dp_slow,

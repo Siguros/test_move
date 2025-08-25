@@ -302,22 +302,17 @@ __global__ void kernelUnpackToFirstKRows(T* dst, const T* src, int d, int x, int
 
 // Step-2: Removed ad-hoc kernels, using existing kernelPack* functions instead
 
-// Step-2: Helper to enforce StochasticCompressed for LR-TT
+// Helper to configure PulseType for LR-TT operations
 template <typename T>
-static inline void enforceStochasticCompressed(PulsedUpdateMetaParameter<T>& up) {
+static inline void configurePulseType(PulsedUpdateMetaParameter<T>& up, 
+                                      PulseType desired_type = PulseType::StochasticCompressed) {
   static bool warned_once = false;
-  if (up.pulse_type != PulseType::StochasticCompressed) {
-    if (!warned_once) {
-      RPU_WARNING("LR-TT: forcing PulseType::StochasticCompressed (was " << (int)up.pulse_type << ")");
+  if (up.pulse_type != desired_type) {
+    if (!warned_once && desired_type == PulseType::StochasticCompressed) {
+      RPU_WARNING("LR-TT: setting PulseType::StochasticCompressed (was " << (int)up.pulse_type << ")");
       warned_once = true;
     }
-    up.pulse_type = PulseType::StochasticCompressed;
-    up.update_management = true;
-    up.update_bl_management = true;
-    // Set reasonable default BL if not specified
-    if (up.desired_BL <= 0) {
-      up.desired_BL = 31;
-    }
+    up.pulse_type = desired_type;
   }
 }
 
@@ -1066,9 +1061,16 @@ void LRTTTransferRPUDeviceCuda<T>::runUpdateKernel(
                 "Ensure PulsedWeightUpdater calls setExposeRawInputs(true) on BitLineMaker.");
     }
     
-    // Step-2: Enforce StochasticCompressed mode for all LR-TT updates
+    // Configure pulse type and BL management based on Python config
     auto up_local = up; // local copy for modification  
-    enforceStochasticCompressed(up_local);
+    configurePulseType(up_local, PulseType::StochasticCompressed);
+    
+    // Apply A/B update BL management settings from Python config
+    up_local.update_bl_management = par.ab_use_bl_management;
+    up_local.update_management = par.ab_use_update_management;
+    if (par.ab_desired_bl > 0) {
+      up_local.desired_BL = par.ab_desired_bl;
+    } // else keep device default
     
     // Apply gradient magnitude correction if enabled (for pulsed path)
     T lr_scaled = lr;
@@ -1099,7 +1101,9 @@ void LRTTTransferRPUDeviceCuda<T>::runUpdateKernel(
         printf("[LR-TT Pulsed] Transfer triggered (counter=%d, every=%d)\n",
                transfer_counter_, transfer_every);
       }
-      doTransfer(up_context->getStream());
+      // Null-safe stream handling for transfer
+      cudaStream_t transfer_stream = up_context ? up_context->getStream() : this->context_->getStream();
+      doTransfer(transfer_stream);
       num_transfers_++;  // Increment transfer counter
     }
     
@@ -1135,6 +1139,72 @@ void LRTTTransferRPUDeviceCuda<T>::doTransfer(cudaStream_t stream) {
 
 
 template <typename T>
+void LRTTTransferRPUDeviceCuda<T>::applyABOuterAsDigitalUpdate(T lr_scale, cudaStream_t stream) {
+  // Digital bypass path: directly update W_visible += lr_scale * (A @ B)
+  const int K = rank_;
+  if (K <= 0 || lr_scale == (T)0) return;
+  
+  initializeDevicePointers();
+  ensureABScratch_();
+  
+  cudaStream_t s = stream ? stream : this->context_->getStream();
+  const int threads = 256;
+  
+  // Save original stream and set the context to use our stream
+  cudaStream_t original_stream = this->context_->getStream();
+  bool need_stream_switch = (s != original_stream);
+  if (need_stream_switch) {
+    this->context_->setExternalStream(s);
+  }
+  
+  // Wait for any pending visible sync before updating visible weights
+  waitVisibleSyncOn(s);
+  
+  // Pack A and B into scratch buffers
+  const int nA = this->d_size_ * K;
+  kernelPackColsWithOffset<<<(nA + threads - 1) / threads, threads, 0, s>>>(
+      dev_temp_d_->getData(), dev_w_a_, this->d_size_, this->x_size_, K, 0);
+  
+  const int nB = K * this->x_size_;
+  kernelPackRowsWithOffset<<<(nB + threads - 1) / threads, threads, 0, s>>>(
+      dev_temp_x_->getData(), dev_w_b_, this->d_size_, this->x_size_, K, 0);
+  
+  // Perform GEMM: W_visible += lr_scale * (A @ B)
+  // A is [d × K], B is [K × x], result updates W_visible [d × x]
+  RPU::math::gemm<T>(
+      this->context_,
+      false, false,  // no transpose
+      this->d_size_, this->x_size_, K,
+      lr_scale,  // alpha
+      dev_temp_d_->getData(), this->d_size_,  // A
+      dev_temp_x_->getData(), K,               // B
+      (T)1.0,    // beta (accumulate)
+      dev_w_visible_, this->d_size_);          // C
+  
+  // Reinitialize fast tiles (A/B) after transfer, same as pulsed path
+  reinitFastTiles(s);
+  
+  // Ensure visible sync event exists
+  if (!visible_sync_ev_) {
+    CUDA_CALL(cudaEventCreateWithFlags(&visible_sync_ev_, cudaEventDisableTiming));
+  }
+  
+  // Record completion event for cross-stream synchronization
+  CUDA_CALL(cudaEventRecord(visible_sync_ev_, s));
+  visible_synced_ = true;  // Event recorded, consumers can wait on it
+  
+  // Restore original stream if we switched
+  if (need_stream_switch) {
+    this->context_->releaseExternalStream();
+  }
+  
+  if (getenv("AIHWKIT_DEBUG_LRTT")) {
+    printf("[LR-TT] Digital transfer: W_visible += %.6e * (A[%d×%d] @ B[%d×%d])\n",
+           (float)lr_scale, this->d_size_, K, K, this->x_size_);
+  }
+}
+
+template <typename T>
 void LRTTTransferRPUDeviceCuda<T>::applyABOuterAsPulsedUpdate(T lr_scale, cudaStream_t stream) {
   const int K = rank_;
   if (K <= 0 || lr_scale == (T)0) return;
@@ -1151,6 +1221,14 @@ void LRTTTransferRPUDeviceCuda<T>::applyABOuterAsPulsedUpdate(T lr_scale, cudaSt
   cudaStream_t ctx_s = this->context_->getStream();
   const bool cross_stream = (ctx_s != s);
   
+  // Check if we should use digital bypass for transfer
+  const auto& par = getPar();
+  if (par.transfer_digital_bypass) {
+    // Digital bypass path: perform direct GEMM update W_visible += transfer_lr * (A @ B)
+    applyABOuterAsDigitalUpdate(lr_scale, stream);
+    return;
+  }
+  
   // Fix B: Create events for stream synchronization
   cudaEvent_t ev_pack_done = nullptr;
   cudaEvent_t ev_update_done = nullptr;
@@ -1163,8 +1241,16 @@ void LRTTTransferRPUDeviceCuda<T>::applyABOuterAsPulsedUpdate(T lr_scale, cudaSt
 
   PulsedUpdateMetaParameter<T> up;
   const auto& par = getPar();
-  up.desired_BL = (par.desired_BL > 0) ? par.desired_BL : 31;
-  enforceStochasticCompressed(up);
+  
+  // Configure pulse type for transfer
+  configurePulseType(up, PulseType::StochasticCompressed);
+  
+  // Apply transfer-specific BL management settings from Python config
+  up.update_bl_management = par.transfer_use_bl_management;
+  up.update_management = par.transfer_use_update_management;
+  if (par.transfer_desired_bl > 0) {
+    up.desired_BL = par.transfer_desired_bl;
+  } // else keep device default
 
   const int chunk = (par.rank_chunk > 0) ? par.rank_chunk : std::min(K, 256);
   const int threads = 256;
@@ -1274,10 +1360,22 @@ void LRTTTransferRPUDeviceCuda<T>::reinitFastTiles(cudaStream_t stream) {
     printf("       -> A_lr = 0 (first K cols of A),  B_lr ~ Kaiming (first K rows of B)\n");
   }
 
+  // Get device pointers for A and B
+  const auto& par = getPar();
+  auto* devA = (par.idx_fastA < this->rpucuda_device_vec_.size())
+    ? this->rpucuda_device_vec_[par.idx_fastA].get() : nullptr;
+  auto* devB = (par.idx_fastB < this->rpucuda_device_vec_.size())
+    ? this->rpucuda_device_vec_[par.idx_fastB].get() : nullptr;
+
   // --- Zero A entirely (safe & simple) -> ensures A_lr == 0
   const int nA_full = d * x;
   const int blocks_A_full = (nA_full + threads - 1) / threads;
   kernelResetWeights<<<blocks_A_full, threads, 0, s>>>(dev_w_a_, nA_full);
+  
+  // Apply bounds to A after zeroing (ensures zeros are within device bounds)
+  if (devA) {
+    devA->clipWeights(dev_w_a_, -1.0);  // -1.0 means use device bounds
+  }
 
   // --- Zero B entirely first (so rows beyond K stay clean)
   const int nB_full = d * x;
@@ -1298,6 +1396,15 @@ void LRTTTransferRPUDeviceCuda<T>::reinitFastTiles(cudaStream_t stream) {
   const int blocks_B_lr = (nB_lr + threads - 1) / threads;
   kernelKaimingInitFirstKRowsStateless<<<blocks_B_lr, threads, 0, s>>>(
       dev_w_b_, d, x, K, seed, std_dev_B);
+  
+  // CRITICAL: Apply bounds to B after Kaiming initialization
+  // This ensures the Kaiming values are clipped to device bounds (e.g., [-1, 1] for ConstantStep)
+  if (devB) {
+    devB->clipWeights(dev_w_b_, -1.0);  // -1.0 means use device bounds
+    if (getenv("AIHWKIT_DEBUG_LRTT")) {
+      printf("[LR-TT] Applied bounds to B after Kaiming init (prevents weight overflow)\n");
+    }
+  }
 }
 
 template <typename T>
@@ -1367,9 +1474,14 @@ void LRTTTransferRPUDeviceCuda<T>::doDirectUpdate(
       printf("[LR-TT DEBUG] Using pulsed LoRA updates (LR_TT mode - always pulsed)\n");
     }
     
-    // Enforce StochasticCompressed for pulsed path
+    // Configure pulse type and apply A/B update BL management settings
     auto up_local = up;
-    enforceStochasticCompressed(up_local);
+    configurePulseType(up_local, PulseType::StochasticCompressed);
+    up_local.update_bl_management = par.ab_use_bl_management;
+    up_local.update_management = par.ab_use_update_management;
+    if (par.ab_desired_bl > 0) {
+      up_local.desired_BL = par.ab_desired_bl;
+    } // else keep device default
     
     // Use pulsed LoRA update - NOT the GEMM-based doLoRAUpdate
     doLoRAPulsedUpdate_(x_in, d_in, lr, m_batch, up_local, this->context_);
@@ -1743,7 +1855,15 @@ void LRTTTransferRPUDeviceCuda<T>::doLoRAPulsedUpdate_(
     RPU_FATAL(ss.str().c_str());
   }
   auto up = up_in;
-  enforceStochasticCompressed(up);
+  configurePulseType(up, PulseType::StochasticCompressed);
+  
+  // Apply A/B update BL management settings from Python config
+  const auto& par = getPar();
+  up.update_bl_management = par.ab_use_bl_management;
+  up.update_management = par.ab_use_update_management;
+  if (par.ab_desired_bl > 0) {
+    up.desired_BL = par.ab_desired_bl;
+  } // else keep device default
 
   cudaStream_t s = up_context ? up_context->getStream() : this->context_->getStream();
   
@@ -1981,8 +2101,10 @@ bool LRTTTransferRPUDeviceCuda<T>::forwardWithAnalogInject(
 
   // Fallback: if not enabled or invalid rank, use existing visible-only path
   if (!par.forward_inject || rank_ <= 0) {
-    printf("[LR-TT DEBUG] Fallback path: forward_inject=%d, rank=%d, dev_w_visible_=%p\n",
-           (int)par.forward_inject, rank_, dev_w_visible_);
+    if (std::getenv("AIHWKIT_DEBUG_LRTT")) {
+      printf("[LR-TT DEBUG] Fallback path: forward_inject=%d, rank=%d, dev_w_visible_=%p\n",
+             (int)par.forward_inject, rank_, dev_w_visible_);
+    }
     fb.computeAnalogMVSinglePassPublic(dev_w_visible_, iom, mv_pars, out_trans, transposed);
     return fb.finalizeOutputPublic(out_values, iom, mv_pars, out_trans, transposed);
   }

@@ -955,12 +955,21 @@ template <typename T> void declare_rpu_devices(py::module &m, std::string type_n
       .def_readwrite("idx_visible", &LRTTTransferParam::idx_visible)
       .def_readwrite("idx_fastA", &LRTTTransferParam::idx_fastA)
       .def_readwrite("idx_fastB", &LRTTTransferParam::idx_fastB)
-      // reset_policy removed in Step 1
-      // gamma removed in Step 1
+      // A/B training update BL management controls
+      .def_readwrite("ab_use_bl_management", &LRTTTransferParam::ab_use_bl_management)
+      .def_readwrite("ab_use_update_management", &LRTTTransferParam::ab_use_update_management)
+      .def_readwrite("ab_desired_bl", &LRTTTransferParam::ab_desired_bl)
+      // Transfer step BL management controls
+      .def_readwrite("transfer_use_bl_management", &LRTTTransferParam::transfer_use_bl_management)
+      .def_readwrite("transfer_use_update_management", &LRTTTransferParam::transfer_use_update_management)
+      .def_readwrite("transfer_desired_bl", &LRTTTransferParam::transfer_desired_bl)
+      .def_readwrite("transfer_digital_bypass", &LRTTTransferParam::transfer_digital_bypass)
+      // Legacy parameters (deprecated but kept for backward compatibility)
       .def_readwrite("desired_BL", &LRTTTransferParam::desired_BL)
+      .def_readwrite("use_bl_management", &LRTTTransferParam::use_bl_management)
+      // Other parameters
       .def_readwrite("swap_xd", &LRTTTransferParam::swap_xd)
       .def_readwrite("correct_gradient_magnitudes", &LRTTTransferParam::correct_gradient_magnitudes)
-      .def_readwrite("use_bl_management", &LRTTTransferParam::use_bl_management)
       .def_readwrite("reinit_gain", &LRTTTransferParam::reinit_gain)
       // reinit_only_lr_subspace removed in Step 1
       // reinit_randomize_A removed in Step 1

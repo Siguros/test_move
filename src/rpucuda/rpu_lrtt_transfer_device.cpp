@@ -55,10 +55,7 @@ void LRTTTransferRPUDeviceMetaParameter<T>::initializeWithSize(int x_size, int d
   //     set 'gamma' consistently (0), and keep transfer_every_vec as all zeros.
   TransferRPUDeviceMetaParameter<T>::initializeWithSize(x_size, d_size);
   
-  // Backward compatibility: if desired_BL == 0 and desired_bl != 0, use desired_bl
-  if (desired_BL == 0 && desired_bl != 0) {
-    desired_BL = desired_bl;
-  }
+  // Legacy field mapping is handled in loadExtra, not here
   
   // Validate rank if specified
   if (rank > 0) {
@@ -105,7 +102,11 @@ void LRTTTransferRPUDeviceMetaParameter<T>::printToStream(std::stringstream &ss)
   ss << "\t Forward inject: " << forward_inject << std::endl;
   ss << "\t Correct gradient magnitudes: " << correct_gradient_magnitudes << std::endl;
   ss << "\t Swap X/D: " << swap_xd << std::endl;
-  ss << "\t Desired BL: " << desired_BL << std::endl;
+  ss << "\t A/B Update BL Management: " << ab_use_bl_management 
+     << ", desired_bl=" << ab_desired_bl << std::endl;
+  ss << "\t Transfer BL Management: " << transfer_use_bl_management 
+     << ", desired_bl=" << transfer_desired_bl << std::endl;
+  ss << "\t Transfer Digital Bypass: " << transfer_digital_bypass << std::endl;
   ss << "\t Step-1 Convention: First " << rank << " columns of A and first " 
      << rank << " rows of B used as LR factors" << std::endl;
   
@@ -276,11 +277,51 @@ void LRTTTransferRPUDeviceMetaParameter<T>::loadExtra(
   // 4) reinit_gain kept
   RPU::load(state, "reinit_gain", this->reinit_gain, /*strict=*/false);
 
-  // 5) desired_BL alias support (legacy 'desired_bl')
-  if (state.count("desired_bl") && !state.count("desired_BL")) {
-    RPU::load(state, "desired_bl", this->desired_BL, /*strict=*/false);
+  // 5) Load new BL management parameters
+  // Check if new fields exist first
+  bool has_new_fields = state.count("ab_use_bl_management") || state.count("transfer_use_bl_management");
+  
+  if (has_new_fields) {
+    // Load new fields if present
+    RPU::load(state, "ab_use_bl_management", this->ab_use_bl_management, /*strict=*/false);
+    RPU::load(state, "ab_use_update_management", this->ab_use_update_management, /*strict=*/false);
+    RPU::load(state, "ab_desired_bl", this->ab_desired_bl, /*strict=*/false);
+    RPU::load(state, "transfer_use_bl_management", this->transfer_use_bl_management, /*strict=*/false);
+    RPU::load(state, "transfer_use_update_management", this->transfer_use_update_management, /*strict=*/false);
+    RPU::load(state, "transfer_desired_bl", this->transfer_desired_bl, /*strict=*/false);
+    RPU::load(state, "transfer_digital_bypass", this->transfer_digital_bypass, /*strict=*/false);
   } else {
+    // Legacy checkpoint: map from old fields to new
+    if (state.count("use_bl_management")) {
+      RPU::load(state, "use_bl_management", this->ab_use_bl_management, /*strict=*/false);
+      // Transfer defaults to false for BL management (new behavior)
+      this->transfer_use_bl_management = false;
+    }
+    
+    // Load legacy desired_BL/desired_bl
+    T legacy_bl = (T)-1.0;
+    if (state.count("desired_bl")) {
+      RPU::load(state, "desired_bl", legacy_bl, /*strict=*/false);
+    } else if (state.count("desired_BL")) {
+      RPU::load(state, "desired_BL", legacy_bl, /*strict=*/false);
+    }
+    
+    if (legacy_bl > 0) {
+      this->ab_desired_bl = legacy_bl;
+      // Transfer gets no override by default (sentinel)
+      this->transfer_desired_bl = (T)-1.0;
+    }
+  }
+  
+  // Always load legacy fields for Python compatibility if they exist
+  if (state.count("use_bl_management")) {
+    RPU::load(state, "use_bl_management", this->use_bl_management, /*strict=*/false);
+  }
+  if (state.count("desired_BL")) {
     RPU::load(state, "desired_BL", this->desired_BL, /*strict=*/false);
+  }
+  if (state.count("desired_bl")) {
+    RPU::load(state, "desired_bl", this->desired_bl, /*strict=*/false);
   }
 
   // 6) Soft-ignore removed keys unless strict=true

@@ -375,7 +375,7 @@ class LinearStepDevice(PulsedDevice):
 
     Pulsed update behavioral model, where the update step response
     size of the material is linearly dependent with resistance (up to
-    hard bounds).
+    hard bounds).updateparameter
 
     This model is based on :class:`~PulsedDevice` and thus
     shares all parameters and functionality. In addition, it only

@@ -81,11 +81,35 @@ class LRTTTransferCompound(TransferCompound):
     lora_alpha: float = 1.0
     """LoRA alpha scaling factor (used only if forward_inject is enabled)."""
     
-    use_bl_management: bool = False
-    """Enable bound level (BL) management in the PulsedWeightUpdater."""
+    # A/B training update BL management controls
+    ab_use_bl_management: bool = True
+    """Enable BL management for A/B training updates (default: True for backward compatibility)."""
     
-    desired_bl: float = 10.0
-    """Desired bound level for the analog tiles (only used if use_bl_management=True)."""
+    ab_use_update_management: bool = True
+    """Enable update management for A/B training updates."""
+    
+    ab_desired_bl: float = -1.0
+    """Desired bound level for A/B training updates (-1 = no override, use device default)."""
+    
+    # Transfer step BL management controls (A@B -> visible)
+    transfer_use_bl_management: bool = False
+    """Enable BL management for transfer step (default: False for linear scaling)."""
+    
+    transfer_use_update_management: bool = False
+    """Enable update management for transfer step."""
+    
+    transfer_desired_bl: float = -1.0
+    """Desired bound level for transfer step (-1 = no override)."""
+    
+    transfer_digital_bypass: bool = False
+    """Bypass pulsed updates for transfer (use digital GEMM instead)."""
+    
+    # Legacy parameters (deprecated, mapped to ab_* for backward compatibility)
+    use_bl_management: bool = False
+    """DEPRECATED: Use ab_use_bl_management instead."""
+    
+    desired_bl: float = 1.0
+    """DEPRECATED: Use ab_desired_bl instead."""
     
     # Step 1: Only reinit_gain remains from reinit parameters
     reinit_gain: float = 1.0
@@ -143,8 +167,26 @@ class LRTTTransferCompound(TransferCompound):
         if self.gamma < 0 or self.gamma > 1:
             raise ValueError(f"gamma must be in [0, 1], got {self.gamma}")
         
-        if self.use_bl_management and self.desired_bl <= 0:
-            raise ValueError(f"desired_bl must be positive when use_bl_management=True, got {self.desired_bl}")
+        # Validate A/B update BL settings (sentinel value -1 means no override)
+        if self.ab_use_bl_management and self.ab_desired_bl != -1.0 and self.ab_desired_bl <= 0:
+            raise ValueError(f"ab_desired_bl must be positive or -1 (no override) when ab_use_bl_management=True, got {self.ab_desired_bl}")
+        
+        # Validate transfer BL settings (sentinel value -1 means no override)
+        if self.transfer_use_bl_management and self.transfer_desired_bl != -1.0 and self.transfer_desired_bl <= 0:
+            raise ValueError(f"transfer_desired_bl must be positive or -1 (no override) when transfer_use_bl_management=True, got {self.transfer_desired_bl}")
+        
+        # Handle legacy parameters for backward compatibility
+        if self.use_bl_management and not hasattr(self, '_legacy_warning_shown'):
+            import warnings
+            warnings.warn("use_bl_management is deprecated. Use ab_use_bl_management instead.", DeprecationWarning)
+            self._legacy_warning_shown = True
+            self.ab_use_bl_management = self.use_bl_management
+        
+        if self.desired_bl != 1.0 and not hasattr(self, '_legacy_bl_warning_shown'):
+            import warnings
+            warnings.warn("desired_bl is deprecated. Use ab_desired_bl instead.", DeprecationWarning)
+            self._legacy_bl_warning_shown = True
+            self.ab_desired_bl = self.desired_bl
         
         # Validate transfer_every (0 allowed for inference)
         if hasattr(self, 'transfer_every') and self.transfer_every < 0:
@@ -215,7 +257,26 @@ class LRTTTransferCompound(TransferCompound):
         if hasattr(lrtt_params, 'swap_xd'):
             lrtt_params.swap_xd = self.swap_xd
             
-        # BL management - map desired_bl to desired_BL
+        # Map Python config to C++ parameters
+        # A/B update BL management
+        if hasattr(lrtt_params, 'ab_use_bl_management'):
+            lrtt_params.ab_use_bl_management = self.ab_use_bl_management
+        if hasattr(lrtt_params, 'ab_use_update_management'):
+            lrtt_params.ab_use_update_management = self.ab_use_update_management
+        if hasattr(lrtt_params, 'ab_desired_bl'):
+            lrtt_params.ab_desired_bl = self.ab_desired_bl
+        
+        # Transfer BL management
+        if hasattr(lrtt_params, 'transfer_use_bl_management'):
+            lrtt_params.transfer_use_bl_management = self.transfer_use_bl_management
+        if hasattr(lrtt_params, 'transfer_use_update_management'):
+            lrtt_params.transfer_use_update_management = self.transfer_use_update_management
+        if hasattr(lrtt_params, 'transfer_desired_bl'):
+            lrtt_params.transfer_desired_bl = self.transfer_desired_bl
+        if hasattr(lrtt_params, 'transfer_digital_bypass'):
+            lrtt_params.transfer_digital_bypass = self.transfer_digital_bypass
+        
+        # Legacy support (map to C++ legacy parameters)
         if hasattr(lrtt_params, 'use_bl_management'):
             lrtt_params.use_bl_management = self.use_bl_management
         if hasattr(lrtt_params, 'desired_BL'):
