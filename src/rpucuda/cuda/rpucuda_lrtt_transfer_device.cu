@@ -591,8 +591,8 @@ LRTTTransferRPUDeviceCuda<T>::LRTTTransferRPUDeviceCuda(
   
   if (getenv("AIHWKIT_DEBUG_LRTT")) {
     printf("[LR-TT CUDA] Constructor: transfer_lr = %.6f, rank = %d\n", (float)transfer_lr_, rank_);
-    printf("[LR-TT CUDA] Constructor: transfer_every = %.0f, units_in_mbatch = %d\n", 
-           (float)transfer_every_, units_in_mbatch_);
+    printf("[LR-TT CUDA] Constructor: transfer_every = %d, units_in_mbatch = %d\n", 
+           transfer_every_, units_in_mbatch_);
     printf("[LR-TT CUDA] Constructor: AB BL mgmt = %d/%d, desired = %.2f\n",
            ab_use_bl_management_, ab_use_update_management_, (float)ab_desired_bl_);
     printf("[LR-TT CUDA] Constructor: Transfer BL mgmt = %d/%d, desired = %.2f\n",
@@ -999,7 +999,7 @@ void LRTTTransferRPUDeviceCuda<T>::populateFrom(const AbstractRPUDevice<T> &rpu_
   
   if (getenv("AIHWKIT_DEBUG_LRTT")) {
     printf("[LR-TT CUDA] populateFrom: transfer_lr = %.6f\n", (float)transfer_lr_);
-    printf("[LR-TT CUDA] populateFrom: transfer_every = %.0f\n", (float)transfer_every_);
+    printf("[LR-TT CUDA] populateFrom: transfer_every = %d\n", transfer_every_);
   }
   
   // CRITICAL: Ensure parent read-based transfer is disabled for LRTT
@@ -1050,13 +1050,13 @@ void LRTTTransferRPUDeviceCuda<T>::populateFrom(const AbstractRPUDevice<T> &rpu_
                   "This is acceptable for inference-only scenarios but breaks the "
                   "'always pulsed' guarantee during training. Current value: " << transfer_every_);
     }
-    if (par.n_reads_per_transfer > 0) {
+    if (n_reads_per_transfer_ > 0) {
       RPU_FATAL("LR-TT requires n_reads_per_transfer == 0 (parent read-based transfer is disabled). "
-                "Current value: " << par.n_reads_per_transfer);
+                "Current value: " << n_reads_per_transfer_);
     }
     if (getenv("AIHWKIT_DEBUG_LRTT")) {
-      printf("[LR-TT CUDA] Transfer validation: transfer_every=%f, n_reads_per_transfer=%d\n",
-             (float)transfer_every_, par.n_reads_per_transfer);
+      printf("[LR-TT CUDA] Transfer validation: transfer_every=%d, n_reads_per_transfer=%d\n",
+             transfer_every_, n_reads_per_transfer_);
     }
   }
   
