@@ -928,6 +928,15 @@ void LRTTTransferRPUDeviceCuda<T>::populateFrom(const AbstractRPUDevice<T> &rpu_
     printf("[LR-TT CUDA] populateFrom complete: PWUs: A=%s, B=%s\n",
            fastA_pwu_ ? "YES" : "NO", fastB_pwu_ ? "YES" : "NO");
   }
+  
+  // Initialize B with Kaiming values at the start (A remains 0)
+  // This ensures B is non-zero from the beginning for proper LoRA operation
+  if (rank_ > 0) {
+    reinitFastTiles(this->context_->getStream());
+    if (getenv("AIHWKIT_DEBUG_LRTT")) {
+      printf("[LR-TT CUDA] Initial reinit complete: A=0, B~Kaiming\n");
+    }
+  }
 }
 
 template <typename T>
@@ -1138,71 +1147,7 @@ void LRTTTransferRPUDeviceCuda<T>::doTransfer(cudaStream_t stream) {
 }
 
 
-template <typename T>
-void LRTTTransferRPUDeviceCuda<T>::applyABOuterAsDigitalUpdate(T lr_scale, cudaStream_t stream) {
-  // Digital bypass path: directly update W_visible += lr_scale * (A @ B)
-  const int K = rank_;
-  if (K <= 0 || lr_scale == (T)0) return;
-  
-  initializeDevicePointers();
-  ensureABScratch_();
-  
-  cudaStream_t s = stream ? stream : this->context_->getStream();
-  const int threads = 256;
-  
-  // Save original stream and set the context to use our stream
-  cudaStream_t original_stream = this->context_->getStream();
-  bool need_stream_switch = (s != original_stream);
-  if (need_stream_switch) {
-    this->context_->setExternalStream(s);
-  }
-  
-  // Wait for any pending visible sync before updating visible weights
-  waitVisibleSyncOn(s);
-  
-  // Pack A and B into scratch buffers
-  const int nA = this->d_size_ * K;
-  kernelPackColsWithOffset<<<(nA + threads - 1) / threads, threads, 0, s>>>(
-      dev_temp_d_->getData(), dev_w_a_, this->d_size_, this->x_size_, K, 0);
-  
-  const int nB = K * this->x_size_;
-  kernelPackRowsWithOffset<<<(nB + threads - 1) / threads, threads, 0, s>>>(
-      dev_temp_x_->getData(), dev_w_b_, this->d_size_, this->x_size_, K, 0);
-  
-  // Perform GEMM: W_visible += lr_scale * (A @ B)
-  // A is [d × K], B is [K × x], result updates W_visible [d × x]
-  RPU::math::gemm<T>(
-      this->context_,
-      false, false,  // no transpose
-      this->d_size_, this->x_size_, K,
-      lr_scale,  // alpha
-      dev_temp_d_->getData(), this->d_size_,  // A
-      dev_temp_x_->getData(), K,               // B
-      (T)1.0,    // beta (accumulate)
-      dev_w_visible_, this->d_size_);          // C
-  
-  // Reinitialize fast tiles (A/B) after transfer, same as pulsed path
-  reinitFastTiles(s);
-  
-  // Ensure visible sync event exists
-  if (!visible_sync_ev_) {
-    CUDA_CALL(cudaEventCreateWithFlags(&visible_sync_ev_, cudaEventDisableTiming));
-  }
-  
-  // Record completion event for cross-stream synchronization
-  CUDA_CALL(cudaEventRecord(visible_sync_ev_, s));
-  visible_synced_ = true;  // Event recorded, consumers can wait on it
-  
-  // Restore original stream if we switched
-  if (need_stream_switch) {
-    this->context_->releaseExternalStream();
-  }
-  
-  if (getenv("AIHWKIT_DEBUG_LRTT")) {
-    printf("[LR-TT] Digital transfer: W_visible += %.6e * (A[%d×%d] @ B[%d×%d])\n",
-           (float)lr_scale, this->d_size_, K, K, this->x_size_);
-  }
-}
+// Digital transfer removed - only pulsed stochastic updates are used
 
 template <typename T>
 void LRTTTransferRPUDeviceCuda<T>::applyABOuterAsPulsedUpdate(T lr_scale, cudaStream_t stream) {
@@ -1221,13 +1166,8 @@ void LRTTTransferRPUDeviceCuda<T>::applyABOuterAsPulsedUpdate(T lr_scale, cudaSt
   cudaStream_t ctx_s = this->context_->getStream();
   const bool cross_stream = (ctx_s != s);
   
-  // Check if we should use digital bypass for transfer
   const auto& par = getPar();
-  if (par.transfer_digital_bypass) {
-    // Digital bypass path: perform direct GEMM update W_visible += transfer_lr * (A @ B)
-    applyABOuterAsDigitalUpdate(lr_scale, stream);
-    return;
-  }
+  // Only pulsed stochastic updates are used (no digital bypass)
   
   // Fix B: Create events for stream synchronization
   cudaEvent_t ev_pack_done = nullptr;
@@ -1240,7 +1180,6 @@ void LRTTTransferRPUDeviceCuda<T>::applyABOuterAsPulsedUpdate(T lr_scale, cudaSt
   if (!visible_pwu_) visible_pwu_ = std::make_unique<PulsedWeightUpdater<T>>(this->context_, this->x_size_, this->d_size_);
 
   PulsedUpdateMetaParameter<T> up;
-  const auto& par = getPar();
   
   // Configure pulse type for transfer
   configurePulseType(up, PulseType::StochasticCompressed);
@@ -1351,6 +1290,13 @@ void LRTTTransferRPUDeviceCuda<T>::reinitFastTiles(cudaStream_t stream) {
   if (K <= 0) return;
 
   cudaStream_t s = stream ? stream : this->context_->getStream();
+  
+  // CRITICAL: Switch context stream to ensure clipWeights uses the same stream
+  bool switched = (this->context_->getStream() != s);
+  if (switched) {
+    this->context_->setExternalStream(s);
+  }
+  
   const int threads = 256;
   const int d = this->d_size_;
   const int x = this->x_size_;
@@ -1400,10 +1346,15 @@ void LRTTTransferRPUDeviceCuda<T>::reinitFastTiles(cudaStream_t stream) {
   // CRITICAL: Apply bounds to B after Kaiming initialization
   // This ensures the Kaiming values are clipped to device bounds (e.g., [-1, 1] for ConstantStep)
   if (devB) {
-    devB->clipWeights(dev_w_b_, -1.0);  // -1.0 means use device bounds
+    devB->clipWeights(dev_w_b_, -1.0);  // -1.0 means use device bounds - now runs on stream s
     if (getenv("AIHWKIT_DEBUG_LRTT")) {
       printf("[LR-TT] Applied bounds to B after Kaiming init (prevents weight overflow)\n");
     }
+  }
+  
+  // Restore original stream if we switched it
+  if (switched) {
+    this->context_->releaseExternalStream();
   }
 }
 
@@ -1919,19 +1870,27 @@ void LRTTTransferRPUDeviceCuda<T>::doLoRAPulsedUpdate_(
   if (!fastA_pwu_) fastA_pwu_ = std::make_unique<PulsedWeightUpdater<T>>(this->context_, this->x_size_, this->d_size_);
   if (!fastB_pwu_) fastB_pwu_ = std::make_unique<PulsedWeightUpdater<T>>(this->context_, this->x_size_, this->d_size_);
 
-  const auto& par = getPar();
-  auto* devA = (par.idx_fastA < this->rpucuda_device_vec_.size())
-    ? dynamic_cast<PulsedRPUDeviceCudaBase<T>*>(this->rpucuda_device_vec_[par.idx_fastA].get()) : nullptr;
-  auto* devB = (par.idx_fastB < this->rpucuda_device_vec_.size())
-    ? dynamic_cast<PulsedRPUDeviceCudaBase<T>*>(this->rpucuda_device_vec_[par.idx_fastB].get()) : nullptr;
+  const auto& fast_par = getPar();
+  auto* devA = (fast_par.idx_fastA < this->rpucuda_device_vec_.size())
+    ? dynamic_cast<PulsedRPUDeviceCudaBase<T>*>(this->rpucuda_device_vec_[fast_par.idx_fastA].get()) : nullptr;
+  auto* devB = (fast_par.idx_fastB < this->rpucuda_device_vec_.size())
+    ? dynamic_cast<PulsedRPUDeviceCudaBase<T>*>(this->rpucuda_device_vec_[fast_par.idx_fastB].get()) : nullptr;
 
   if (devA) {
+    if (getenv("AIHWKIT_DEBUG_LRTT")) {
+      printf("[LR-TT DEBUG] Updating A device (idx=%d), lr=%.6e\n", fast_par.idx_fastA, (float)lr);
+    }
+    num_a_updates_++;
     fastA_pwu_->update(
         dev_x_pad_->getData(),  // X = padded X_B (rank rows)
         d_in,                   // D = original D
         dev_w_a_, devA, up, lr, m_batch, /*x_trans=*/false, /*d_trans=*/false);
   }
   if (devB) {
+    if (getenv("AIHWKIT_DEBUG_LRTT")) {
+      printf("[LR-TT DEBUG] Updating B device (idx=%d), lr=%.6e\n", fast_par.idx_fastB, (float)lr);
+    }
+    num_b_updates_++;
     fastB_pwu_->update(
         x_in,                   // X = original X
         dev_d_pad_->getData(),  // D = padded D_A (rank rows)

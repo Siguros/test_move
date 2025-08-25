@@ -46,7 +46,7 @@ void LRTTTransferRPUDeviceMetaParameter<T>::initializeWithSize(int x_size, int d
   // (Parent will also set gamma = sum(gamma_vec[0..last-1]) == 0.)
   this->gamma = (T)0.0;
   
-  // --- Update policy for LR-TT (CUDA sequences A/B; base must not try multi-device updates)
+  // --- Update policy for LR-TT (CUDA handles A/B sequencing directly)
   this->update_policy = VectorDeviceUpdatePolicy::SingleFixed;
   this->first_update_idx = idx_fastA;
   this->same_context = true;
@@ -106,7 +106,7 @@ void LRTTTransferRPUDeviceMetaParameter<T>::printToStream(std::stringstream &ss)
      << ", desired_bl=" << ab_desired_bl << std::endl;
   ss << "\t Transfer BL Management: " << transfer_use_bl_management 
      << ", desired_bl=" << transfer_desired_bl << std::endl;
-  ss << "\t Transfer Digital Bypass: " << transfer_digital_bypass << std::endl;
+  // Digital transfer removed - only pulsed stochastic updates are used
   ss << "\t Step-1 Convention: First " << rank << " columns of A and first " 
      << rank << " rows of B used as LR factors" << std::endl;
   
@@ -289,7 +289,9 @@ void LRTTTransferRPUDeviceMetaParameter<T>::loadExtra(
     RPU::load(state, "transfer_use_bl_management", this->transfer_use_bl_management, /*strict=*/false);
     RPU::load(state, "transfer_use_update_management", this->transfer_use_update_management, /*strict=*/false);
     RPU::load(state, "transfer_desired_bl", this->transfer_desired_bl, /*strict=*/false);
-    RPU::load(state, "transfer_digital_bypass", this->transfer_digital_bypass, /*strict=*/false);
+    // Digital transfer removed - loading transfer_digital_bypass for backward compatibility only
+    bool dummy_digital_bypass = false;
+    RPU::load(state, "transfer_digital_bypass", dummy_digital_bypass, /*strict=*/false);
   } else {
     // Legacy checkpoint: map from old fields to new
     if (state.count("use_bl_management")) {

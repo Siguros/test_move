@@ -101,8 +101,7 @@ class LRTTTransferCompound(TransferCompound):
     transfer_desired_bl: float = -1.0
     """Desired bound level for transfer step (-1 = no override)."""
     
-    transfer_digital_bypass: bool = False
-    """Bypass pulsed updates for transfer (use digital GEMM instead)."""
+    # Digital transfer removed - only pulsed stochastic updates are used
     
     # Legacy parameters (deprecated, mapped to ab_* for backward compatibility)
     use_bl_management: bool = False
@@ -273,8 +272,7 @@ class LRTTTransferCompound(TransferCompound):
             lrtt_params.transfer_use_update_management = self.transfer_use_update_management
         if hasattr(lrtt_params, 'transfer_desired_bl'):
             lrtt_params.transfer_desired_bl = self.transfer_desired_bl
-        if hasattr(lrtt_params, 'transfer_digital_bypass'):
-            lrtt_params.transfer_digital_bypass = self.transfer_digital_bypass
+        # Digital transfer removed - only pulsed stochastic updates are used
         
         # Legacy support (map to C++ legacy parameters)
         if hasattr(lrtt_params, 'use_bl_management'):

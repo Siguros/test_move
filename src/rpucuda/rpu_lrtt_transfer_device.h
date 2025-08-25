@@ -67,7 +67,7 @@ struct LRTTTransferRPUDeviceMetaParameter : public TransferRPUDeviceMetaParamete
   bool transfer_use_bl_management = false;  // Enable BL management for transfer (default: false for linear scaling)
   bool transfer_use_update_management = false;  // Enable update management for transfer
   T transfer_desired_bl = (T)-1.0;  // Desired bound level for transfer (-1 = no override)
-  bool transfer_digital_bypass = false;  // Bypass pulsed updates for transfer (use digital GEMM)
+  // Digital transfer removed - only pulsed stochastic updates are used
   
   // Legacy BL controls (deprecated, mapped to ab_* parameters for backward compatibility)
   bool use_bl_management = false;  // DEPRECATED: Use ab_use_bl_management instead

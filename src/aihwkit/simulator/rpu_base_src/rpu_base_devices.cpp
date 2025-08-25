@@ -963,7 +963,7 @@ template <typename T> void declare_rpu_devices(py::module &m, std::string type_n
       .def_readwrite("transfer_use_bl_management", &LRTTTransferParam::transfer_use_bl_management)
       .def_readwrite("transfer_use_update_management", &LRTTTransferParam::transfer_use_update_management)
       .def_readwrite("transfer_desired_bl", &LRTTTransferParam::transfer_desired_bl)
-      .def_readwrite("transfer_digital_bypass", &LRTTTransferParam::transfer_digital_bypass)
+      // Digital transfer removed - only pulsed stochastic updates are used
       // Legacy parameters (deprecated but kept for backward compatibility)
       .def_readwrite("desired_BL", &LRTTTransferParam::desired_BL)
       .def_readwrite("use_bl_management", &LRTTTransferParam::use_bl_management)
