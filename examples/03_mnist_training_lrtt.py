@@ -58,7 +58,7 @@ MONITOR_LRTT = True  # Enable LRTT operation monitoring
 
 # LR-TT parameters
 LRTT_RANK = 8  # Low-rank dimension
-TRANSFER_EVERY = 100  # Transfer every N updates
+TRANSFER_EVERY = 2  # Transfer every N updates
 TRANSFER_LR = 0.00000001  # Transfer learning rate (Note: actual transfer is limited by device dw_min)
 
 
@@ -107,6 +107,8 @@ def create_lrtt_config():
         transfer_lr=TRANSFER_LR,
         forward_inject=True,  # Use effective weights in forward pass
         lora_alpha=8.0,
+        transfer_use_bl_management=False,
+        transfer_use_update_management=False
     )
     return SingleRPUConfig(device=lrtt_config)
 
@@ -132,21 +134,21 @@ def create_analog_network_lrtt(input_size, hidden_sizes, output_size):
         AnalogLinear(
             input_size,
             hidden_sizes[0],
-            True,
+            False,
             rpu_config=lrtt_config,
         ),
         nn.Sigmoid(),
         AnalogLinear(
             hidden_sizes[0],
             hidden_sizes[1],
-            True,
+            False,
             rpu_config=lrtt_config,
         ),
         nn.Sigmoid(),
         AnalogLinear(
             hidden_sizes[1],
             output_size,
-            True,
+            False,
             rpu_config=fp_config,  # Use FloatingPointDevice for last layer
         ),
         nn.LogSoftmax(dim=1),

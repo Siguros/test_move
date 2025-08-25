@@ -59,6 +59,16 @@ public:
     using std::swap;
     swap(static_cast<TransferRPUDeviceCuda<T> &>(a), static_cast<TransferRPUDeviceCuda<T> &>(b));
     swap(a.rank_, b.rank_);
+    swap(a.transfer_lr_, b.transfer_lr_);
+    swap(a.transfer_every_, b.transfer_every_);
+    swap(a.units_in_mbatch_, b.units_in_mbatch_);
+    swap(a.n_reads_per_transfer_, b.n_reads_per_transfer_);
+    swap(a.ab_use_bl_management_, b.ab_use_bl_management_);
+    swap(a.ab_use_update_management_, b.ab_use_update_management_);
+    swap(a.ab_desired_bl_, b.ab_desired_bl_);
+    swap(a.transfer_use_bl_management_, b.transfer_use_bl_management_);
+    swap(a.transfer_use_update_management_, b.transfer_use_update_management_);
+    swap(a.transfer_desired_bl_, b.transfer_desired_bl_);
     swap(a.dev_w_visible_, b.dev_w_visible_);
     swap(a.dev_w_a_, b.dev_w_a_);
     swap(a.dev_w_b_, b.dev_w_b_);
@@ -80,11 +90,21 @@ public:
     swap(a.num_b_updates_, b.num_b_updates_);
     swap(a.num_transfers_, b.num_transfers_);
     swap(a.debug_no_host_copies_, b.debug_no_host_copies_);
+    swap(a.reinit_counter_, b.reinit_counter_);
     swap(a.dev_fb_out_, b.dev_fb_out_);
     swap(a.dev_y_ab_, b.dev_y_ab_);
     swap(a.visible_synced_, b.visible_synced_);
     swap(a.last_agg_ptr_, b.last_agg_ptr_);
     swap(a.visible_sync_ev_, b.visible_sync_ev_);
+    swap(a.rank_chunk_, b.rank_chunk_);
+    swap(a.correct_gradient_magnitudes_, b.correct_gradient_magnitudes_);
+    swap(a.forward_inject_, b.forward_inject_);
+    swap(a.lora_alpha_, b.lora_alpha_);
+    swap(a.reinit_gain_, b.reinit_gain_);
+    swap(a.idx_fastA_, b.idx_fastA_);
+    swap(a.idx_fastB_, b.idx_fastB_);
+    swap(a.idx_visible_, b.idx_visible_);
+    swap(a.update_rule_, b.update_rule_);
   }
   
   // Get parameter
@@ -211,27 +231,10 @@ protected:
   void ensureScratchBuffers(int m_batch);
   
   // Scratch for packed A_lr / B_lr and their gradients
-  void ensureABScratch_() {
-    const int need_a = this->d_size_ * rank_;
-    const int need_b = rank_ * this->x_size_;
-    if (!dev_temp_d_ || dev_temp_d_->getSize() < need_a) {
-      dev_temp_d_ = std::make_unique<CudaArray<T>>(this->context_, need_a);
-    }
-    if (!dev_temp_x_ || dev_temp_x_->getSize() < need_b) {
-      dev_temp_x_ = std::make_unique<CudaArray<T>>(this->context_, need_b);
-    }
-  }
+  void ensureABScratch_();
   
   // Helper to ensure padded buffers for pulsed path
-  void ensurePaddedBuffers(int m_batch) {
-    if (!dev_x_pad_ || dev_x_pad_->getSize() < this->x_size_ * m_batch) {
-      dev_x_pad_ = std::make_unique<CudaArray<T>>(this->context_, this->x_size_ * m_batch);
-    }
-    if (!dev_d_pad_ || dev_d_pad_->getSize() < this->d_size_ * m_batch) {
-      dev_d_pad_ = std::make_unique<CudaArray<T>>(this->context_, this->d_size_ * m_batch);
-    }
-    // PWUs are now initialized in constructor, populateFrom, and doLoRAPulsedUpdate_
-  }
+  void ensurePaddedBuffers(int m_batch);
   
   // LoRA update helpers
   void doLoRAUpdate(
@@ -254,6 +257,33 @@ protected:
   
 private:
   int rank_ = -1;
+  T transfer_lr_ = (T)1.0;  // Store transfer_lr locally
+  int transfer_every_ = 1;  // Store transfer_every locally (integer cadence)
+  bool units_in_mbatch_ = false;  // Store units_in_mbatch locally
+  int n_reads_per_transfer_ = 0;  // Store n_reads_per_transfer locally (must be 0 for LRTT)
+  
+  // BL management parameters (stored locally to avoid cast issues)
+  bool ab_use_bl_management_ = true;
+  bool ab_use_update_management_ = true;
+  T ab_desired_bl_ = (T)-1.0;
+  bool transfer_use_bl_management_ = false;
+  bool transfer_use_update_management_ = false;
+  T transfer_desired_bl_ = (T)-1.0;
+  
+  // Additional LRTT parameters (stored locally to avoid cast issues)
+  int rank_chunk_ = -1;  // Process rank in chunks of this size (-1 = use full rank)
+  bool correct_gradient_magnitudes_ = false;  // Whether to correct gradient magnitudes
+  bool forward_inject_ = true;  // Enable forward injection (default: true)
+  T lora_alpha_ = (T)1.0;  // LoRA alpha scaling factor
+  T reinit_gain_ = (T)1.0;  // Gain for Kaiming(He) normal on A
+  
+  // Device indices (stored locally to avoid cast issues)
+  int idx_fastA_ = 0;  // Index of fast device A in the vector
+  int idx_fastB_ = 1;  // Index of fast device B in the vector
+  int idx_visible_ = 2;  // Index of visible device in the vector
+  
+  // Update rule (stored locally to avoid cast issues)
+  LRUpdateRule update_rule_ = LRUpdateRule::LR_TT;  // Fixed to LR_TT
   
   // Device weight pointers (no ownership, just references)
   T *dev_w_visible_ = nullptr;
@@ -289,6 +319,9 @@ private:
   
   // Debug counter for host copies
   mutable int debug_no_host_copies_ = 0;
+  
+  // Reinit counter for thread-safe random seed generation
+  unsigned long long reinit_counter_ = 0;
   
   // Temporary buffers for analog forward-inject
   std::unique_ptr<CudaArray<T>> dev_fb_out_; // B*x full result [d_size * m_batch]

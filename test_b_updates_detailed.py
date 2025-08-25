@@ -7,7 +7,13 @@ import numpy as np
 from aihwkit.nn import AnalogLinear
 from aihwkit.simulator.presets.lrtt import lrtt_idealized
 from aihwkit.optim import AnalogSGD
-
+from aihwkit.simulator.configs import (
+    SingleRPUConfig, 
+    FloatingPointRPUConfig,
+    LRTTTransferCompound, 
+    ConstantStepDevice, 
+    FloatingPointDevice
+)
 # Set debugging
 import os
 os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
@@ -23,11 +29,16 @@ rank = 2
 batch_size = 4
 transfer_every = 100
 
-# Create LRTT config
-config = lrtt_idealized(rank=rank)
-device = config.device
-device.transfer_every = transfer_every
-device.transfer_lr = 0.01
+# Create LRTT confi
+device = device = ConstantStepDevice(dw_min=0.001)
+config = LRTTTransferCompound(
+        unit_cell_devices=[device, device, device],  # fastA, fastB, visible
+        rank=2,
+        transfer_every=3,
+        transfer_lr=0.1,
+        forward_inject=True,  # Use effective weights in forward pass
+        lora_alpha=8.0,
+    )
 
 print(f"\nConfiguration:")
 print(f"  Dimensions: {d_size}x{x_size}")

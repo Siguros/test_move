@@ -33,9 +33,11 @@ def test_lrtt_with_transfer_every(transfer_every_val):
         rank=2,
         transfer_every=transfer_every_val,
         transfer_lr=0.1,
-        forward_inject=True
+        forward_inject=True,
+        transfer_use_bl_management=False,
+        transfer_use_update_management=False
     )
-    
+
     # Minimal update parameters
     update_params = UpdateParameters(
         pulse_type=PulseType.STOCHASTIC_COMPRESSED,

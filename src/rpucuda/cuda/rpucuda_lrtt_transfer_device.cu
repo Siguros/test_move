@@ -20,6 +20,7 @@
 #include <cstdlib>          // std::getenv
 #include <sstream>          // std::ostringstream
 #include <cstdio>           // printf
+#include <type_traits>      // std::is_same
 #include <curand_kernel.h>  // curandState_t, curand_normal(_double)
 
 namespace RPU {
@@ -191,8 +192,8 @@ __global__ void kernelKaimingInitFirstKColsStateless(
   curandStatePhilox4_32_10_t rng;
   curand_init(seed, /*subsequence=*/(unsigned long long)i, /*offset=*/0ULL, &rng);
   
-  // Generate normal deviate and scale by std
-  T z = (T)curand_normal(&rng) * std;
+  // Generate normal deviate and scale by std (with proper double precision support)
+  T z = std::is_same<T,double>::value ? (T)curand_normal_double(&rng) * std : (T)curand_normal(&rng) * std;
   W[idx] = z;
 }
 
@@ -223,7 +224,8 @@ __global__ void kernelKaimingInitFirstKRowsStateless(
   curandStatePhilox4_32_10_t rng;
   curand_init(seed, static_cast<unsigned long long>(i), 0ULL, &rng);
 
-  T z = (T)curand_normal(&rng) * std;
+  // Generate normal deviate and scale by std (with proper double precision support)
+  T z = std::is_same<T,double>::value ? (T)curand_normal_double(&rng) * std : (T)curand_normal(&rng) * std;
   W[idx] = z;
 }
 
@@ -306,12 +308,8 @@ __global__ void kernelUnpackToFirstKRows(T* dst, const T* src, int d, int x, int
 template <typename T>
 static inline void configurePulseType(PulsedUpdateMetaParameter<T>& up, 
                                       PulseType desired_type = PulseType::StochasticCompressed) {
-  static bool warned_once = false;
   if (up.pulse_type != desired_type) {
-    if (!warned_once && desired_type == PulseType::StochasticCompressed) {
-      RPU_WARNING("LR-TT: setting PulseType::StochasticCompressed (was " << (int)up.pulse_type << ")");
-      warned_once = true;
-    }
+    // Always set to StochasticCompressed for LR-TT (no warning to avoid thread-safety issues)
     up.pulse_type = desired_type;
   }
 }
@@ -561,6 +559,46 @@ LRTTTransferRPUDeviceCuda<T>::LRTTTransferRPUDeviceCuda(
   // Extract rank from CPU device (Step-1: using config value, not device dimensions)
   rank_ = cpu_device.getRank();
   
+  // CRITICAL FIX: Extract all LRTT parameters from CPU device
+  const auto &lrtt_cpu_par = cpu_device.getPar();
+  transfer_lr_ = lrtt_cpu_par.transfer_lr;
+  transfer_every_ = lrtt_cpu_par.transfer_every;
+  units_in_mbatch_ = lrtt_cpu_par.units_in_mbatch;
+  n_reads_per_transfer_ = lrtt_cpu_par.n_reads_per_transfer;
+  
+  // BL management parameters
+  ab_use_bl_management_ = lrtt_cpu_par.ab_use_bl_management;
+  ab_use_update_management_ = lrtt_cpu_par.ab_use_update_management;
+  ab_desired_bl_ = lrtt_cpu_par.ab_desired_bl;
+  transfer_use_bl_management_ = lrtt_cpu_par.transfer_use_bl_management;
+  transfer_use_update_management_ = lrtt_cpu_par.transfer_use_update_management;
+  transfer_desired_bl_ = lrtt_cpu_par.transfer_desired_bl;
+  
+  // Additional LRTT parameters
+  rank_chunk_ = lrtt_cpu_par.rank_chunk;
+  correct_gradient_magnitudes_ = lrtt_cpu_par.correct_gradient_magnitudes;
+  forward_inject_ = lrtt_cpu_par.forward_inject;
+  lora_alpha_ = lrtt_cpu_par.lora_alpha;
+  reinit_gain_ = lrtt_cpu_par.reinit_gain;
+  
+  // Device indices
+  idx_fastA_ = lrtt_cpu_par.idx_fastA;
+  idx_fastB_ = lrtt_cpu_par.idx_fastB;
+  idx_visible_ = lrtt_cpu_par.idx_visible;
+  
+  // Update rule (always LR_TT for this device)
+  update_rule_ = lrtt_cpu_par.update_rule;
+  
+  if (getenv("AIHWKIT_DEBUG_LRTT")) {
+    printf("[LR-TT CUDA] Constructor: transfer_lr = %.6f, rank = %d\n", (float)transfer_lr_, rank_);
+    printf("[LR-TT CUDA] Constructor: transfer_every = %.0f, units_in_mbatch = %d\n", 
+           (float)transfer_every_, units_in_mbatch_);
+    printf("[LR-TT CUDA] Constructor: AB BL mgmt = %d/%d, desired = %.2f\n",
+           ab_use_bl_management_, ab_use_update_management_, (float)ab_desired_bl_);
+    printf("[LR-TT CUDA] Constructor: Transfer BL mgmt = %d/%d, desired = %.2f\n",
+           transfer_use_bl_management_, transfer_use_update_management_, (float)transfer_desired_bl_);
+  }
+  
   // Initialize counters to zero
   transfer_counter_ = 0;
   num_a_updates_ = 0;
@@ -594,13 +632,11 @@ LRTTTransferRPUDeviceCuda<T>::LRTTTransferRPUDeviceCuda(
   
   // Initialize PWUs for pulsed path if we have valid devices
   if (rank_ > 0 && this->rpucuda_device_vec_.size() >= 3) {
-    const auto& par = getPar();
-    
     // Check if fastA device supports pulsed updates
-    if (par.idx_fastA < this->rpucuda_device_vec_.size() && 
-        this->rpucuda_device_vec_[par.idx_fastA]) {
+    if (idx_fastA_ < this->rpucuda_device_vec_.size() && 
+        this->rpucuda_device_vec_[idx_fastA_]) {
       auto* devA = dynamic_cast<PulsedRPUDeviceCudaBase<T>*>(
-          this->rpucuda_device_vec_[par.idx_fastA].get());
+          this->rpucuda_device_vec_[idx_fastA_].get());
       if (devA) {
         // Create PWU for fastA (d_size x x_size for full matrix)
         fastA_pwu_ = std::make_unique<PulsedWeightUpdater<T>>(c, x_size, d_size);
@@ -611,10 +647,10 @@ LRTTTransferRPUDeviceCuda<T>::LRTTTransferRPUDeviceCuda(
     }
     
     // Check if fastB device supports pulsed updates
-    if (par.idx_fastB < this->rpucuda_device_vec_.size() && 
-        this->rpucuda_device_vec_[par.idx_fastB]) {
+    if (idx_fastB_ < this->rpucuda_device_vec_.size() && 
+        this->rpucuda_device_vec_[idx_fastB_]) {
       auto* devB = dynamic_cast<PulsedRPUDeviceCudaBase<T>*>(
-          this->rpucuda_device_vec_[par.idx_fastB].get());
+          this->rpucuda_device_vec_[idx_fastB_].get());
       if (devB) {
         // Create PWU for fastB (d_size x x_size for full matrix)
         fastB_pwu_ = std::make_unique<PulsedWeightUpdater<T>>(c, x_size, d_size);
@@ -650,6 +686,25 @@ LRTTTransferRPUDeviceCuda<T>::LRTTTransferRPUDeviceCuda(
     const LRTTTransferRPUDeviceCuda<T> &other)
     : TransferRPUDeviceCuda<T>(other),
       rank_(other.rank_),
+      transfer_lr_(other.transfer_lr_),
+      transfer_every_(other.transfer_every_),
+      units_in_mbatch_(other.units_in_mbatch_),
+      n_reads_per_transfer_(other.n_reads_per_transfer_),
+      ab_use_bl_management_(other.ab_use_bl_management_),
+      ab_use_update_management_(other.ab_use_update_management_),
+      ab_desired_bl_(other.ab_desired_bl_),
+      transfer_use_bl_management_(other.transfer_use_bl_management_),
+      transfer_use_update_management_(other.transfer_use_update_management_),
+      transfer_desired_bl_(other.transfer_desired_bl_),
+      rank_chunk_(other.rank_chunk_),
+      correct_gradient_magnitudes_(other.correct_gradient_magnitudes_),
+      forward_inject_(other.forward_inject_),
+      lora_alpha_(other.lora_alpha_),
+      reinit_gain_(other.reinit_gain_),
+      idx_fastA_(other.idx_fastA_),
+      idx_fastB_(other.idx_fastB_),
+      idx_visible_(other.idx_visible_),
+      update_rule_(other.update_rule_),
       transfer_counter_(0),
       num_a_updates_(0),
       num_b_updates_(0),
@@ -705,6 +760,24 @@ LRTTTransferRPUDeviceCuda<T>::operator=(const LRTTTransferRPUDeviceCuda<T> &othe
   if (this != &other) {
     TransferRPUDeviceCuda<T>::operator=(other);
     rank_ = other.rank_;
+    transfer_lr_ = other.transfer_lr_;
+    transfer_every_ = other.transfer_every_;
+    units_in_mbatch_ = other.units_in_mbatch_;
+    ab_use_bl_management_ = other.ab_use_bl_management_;
+    ab_use_update_management_ = other.ab_use_update_management_;
+    ab_desired_bl_ = other.ab_desired_bl_;
+    transfer_use_bl_management_ = other.transfer_use_bl_management_;
+    transfer_use_update_management_ = other.transfer_use_update_management_;
+    transfer_desired_bl_ = other.transfer_desired_bl_;
+    rank_chunk_ = other.rank_chunk_;
+    correct_gradient_magnitudes_ = other.correct_gradient_magnitudes_;
+    forward_inject_ = other.forward_inject_;
+    lora_alpha_ = other.lora_alpha_;
+    reinit_gain_ = other.reinit_gain_;
+    idx_fastA_ = other.idx_fastA_;
+    idx_fastB_ = other.idx_fastB_;
+    idx_visible_ = other.idx_visible_;
+    update_rule_ = other.update_rule_;
     transfer_counter_ = 0;
     num_a_updates_ = 0;
     num_b_updates_ = 0;
@@ -764,6 +837,25 @@ LRTTTransferRPUDeviceCuda<T>::LRTTTransferRPUDeviceCuda(
     LRTTTransferRPUDeviceCuda<T> &&other) noexcept
     : TransferRPUDeviceCuda<T>(std::move(other)),
       rank_(other.rank_),
+      transfer_lr_(other.transfer_lr_),
+      transfer_every_(other.transfer_every_),
+      units_in_mbatch_(other.units_in_mbatch_),
+      n_reads_per_transfer_(other.n_reads_per_transfer_),
+      ab_use_bl_management_(other.ab_use_bl_management_),
+      ab_use_update_management_(other.ab_use_update_management_),
+      ab_desired_bl_(other.ab_desired_bl_),
+      transfer_use_bl_management_(other.transfer_use_bl_management_),
+      transfer_use_update_management_(other.transfer_use_update_management_),
+      transfer_desired_bl_(other.transfer_desired_bl_),
+      rank_chunk_(other.rank_chunk_),
+      correct_gradient_magnitudes_(other.correct_gradient_magnitudes_),
+      forward_inject_(other.forward_inject_),
+      lora_alpha_(other.lora_alpha_),
+      reinit_gain_(other.reinit_gain_),
+      idx_fastA_(other.idx_fastA_),
+      idx_fastB_(other.idx_fastB_),
+      idx_visible_(other.idx_visible_),
+      update_rule_(other.update_rule_),
       dev_w_visible_(other.dev_w_visible_),
       dev_w_a_(other.dev_w_a_),
       dev_w_b_(other.dev_w_b_),
@@ -784,6 +876,7 @@ LRTTTransferRPUDeviceCuda<T>::LRTTTransferRPUDeviceCuda(
       num_b_updates_(other.num_b_updates_),
       num_transfers_(other.num_transfers_),
       debug_no_host_copies_(other.debug_no_host_copies_),
+      reinit_counter_(other.reinit_counter_),
       dev_fb_out_(std::move(other.dev_fb_out_)),
       dev_y_ab_(std::move(other.dev_y_ab_)),
       visible_synced_(other.visible_synced_),
@@ -803,6 +896,24 @@ LRTTTransferRPUDeviceCuda<T>::operator=(LRTTTransferRPUDeviceCuda<T> &&other) no
   if (this != &other) {
     TransferRPUDeviceCuda<T>::operator=(std::move(other));
     rank_ = other.rank_;
+    transfer_lr_ = other.transfer_lr_;
+    transfer_every_ = other.transfer_every_;
+    units_in_mbatch_ = other.units_in_mbatch_;
+    ab_use_bl_management_ = other.ab_use_bl_management_;
+    ab_use_update_management_ = other.ab_use_update_management_;
+    ab_desired_bl_ = other.ab_desired_bl_;
+    transfer_use_bl_management_ = other.transfer_use_bl_management_;
+    transfer_use_update_management_ = other.transfer_use_update_management_;
+    transfer_desired_bl_ = other.transfer_desired_bl_;
+    rank_chunk_ = other.rank_chunk_;
+    correct_gradient_magnitudes_ = other.correct_gradient_magnitudes_;
+    forward_inject_ = other.forward_inject_;
+    lora_alpha_ = other.lora_alpha_;
+    reinit_gain_ = other.reinit_gain_;
+    idx_fastA_ = other.idx_fastA_;
+    idx_fastB_ = other.idx_fastB_;
+    idx_visible_ = other.idx_visible_;
+    update_rule_ = other.update_rule_;
     dev_w_visible_ = other.dev_w_visible_;
     dev_w_a_ = other.dev_w_a_;
     dev_w_b_ = other.dev_w_b_;
@@ -851,14 +962,49 @@ void LRTTTransferRPUDeviceCuda<T>::populateFrom(const AbstractRPUDevice<T> &rpu_
   // Cast to our type
   const auto &cpu_device = static_cast<const LRTTTransferRPUDevice<T> &>(rpu_device);
   
-  // Parameters are stored in base class
+  // Get the LRTT-specific parameters
+  const auto &lrtt_cpu_par = cpu_device.getPar();
   
   // Extract rank from CPU device
   rank_ = cpu_device.getRank();
   
-  // Ensure parent read-based transfer is disabled for LRTT
-  const auto &lrtt_par = getPar();
-  if (lrtt_par.n_reads_per_transfer > 0) {
+  // CRITICAL FIX: Copy all LRTT parameters
+  transfer_lr_ = lrtt_cpu_par.transfer_lr;
+  transfer_every_ = lrtt_cpu_par.transfer_every;
+  units_in_mbatch_ = lrtt_cpu_par.units_in_mbatch;
+  n_reads_per_transfer_ = lrtt_cpu_par.n_reads_per_transfer;
+  
+  // BL management parameters
+  ab_use_bl_management_ = lrtt_cpu_par.ab_use_bl_management;
+  ab_use_update_management_ = lrtt_cpu_par.ab_use_update_management;
+  ab_desired_bl_ = lrtt_cpu_par.ab_desired_bl;
+  transfer_use_bl_management_ = lrtt_cpu_par.transfer_use_bl_management;
+  transfer_use_update_management_ = lrtt_cpu_par.transfer_use_update_management;
+  transfer_desired_bl_ = lrtt_cpu_par.transfer_desired_bl;
+  
+  // Additional LRTT parameters
+  rank_chunk_ = lrtt_cpu_par.rank_chunk;
+  correct_gradient_magnitudes_ = lrtt_cpu_par.correct_gradient_magnitudes;
+  forward_inject_ = lrtt_cpu_par.forward_inject;
+  lora_alpha_ = lrtt_cpu_par.lora_alpha;
+  reinit_gain_ = lrtt_cpu_par.reinit_gain;
+  
+  // Device indices
+  idx_fastA_ = lrtt_cpu_par.idx_fastA;
+  idx_fastB_ = lrtt_cpu_par.idx_fastB;
+  idx_visible_ = lrtt_cpu_par.idx_visible;
+  
+  // Update rule (always LR_TT for this device)
+  update_rule_ = lrtt_cpu_par.update_rule;
+  
+  if (getenv("AIHWKIT_DEBUG_LRTT")) {
+    printf("[LR-TT CUDA] populateFrom: transfer_lr = %.6f\n", (float)transfer_lr_);
+    printf("[LR-TT CUDA] populateFrom: transfer_every = %.0f\n", (float)transfer_every_);
+  }
+  
+  // CRITICAL: Ensure parent read-based transfer is disabled for LRTT
+  // This prevents double accumulation between parent's read-based transfer and our pulsed transfer
+  if (n_reads_per_transfer_ > 0) {
     RPU_FATAL("LRTT: n_reads_per_transfer must be 0 for LRTT devices. Parent read-based transfer causes double accumulation.");
   }
   
@@ -871,13 +1017,11 @@ void LRTTTransferRPUDeviceCuda<T>::populateFrom(const AbstractRPUDevice<T> &rpu_
   
   // Re-initialize PWUs after population if needed
   if (rank_ > 0 && this->rpucuda_device_vec_.size() >= 3) {
-    const auto& par = getPar();
-    
     // Check if we need to create PWUs
-    if (!fastA_pwu_ && par.idx_fastA < this->rpucuda_device_vec_.size() && 
-        this->rpucuda_device_vec_[par.idx_fastA]) {
+    if (!fastA_pwu_ && idx_fastA_ < this->rpucuda_device_vec_.size() && 
+        this->rpucuda_device_vec_[idx_fastA_]) {
       auto* devA = dynamic_cast<PulsedRPUDeviceCudaBase<T>*>(
-          this->rpucuda_device_vec_[par.idx_fastA].get());
+          this->rpucuda_device_vec_[idx_fastA_].get());
       if (devA) {
         fastA_pwu_ = std::make_unique<PulsedWeightUpdater<T>>(this->context_, this->x_size_, this->d_size_);
         if (getenv("AIHWKIT_DEBUG_LRTT")) {
@@ -886,10 +1030,10 @@ void LRTTTransferRPUDeviceCuda<T>::populateFrom(const AbstractRPUDevice<T> &rpu_
       }
     }
     
-    if (!fastB_pwu_ && par.idx_fastB < this->rpucuda_device_vec_.size() && 
-        this->rpucuda_device_vec_[par.idx_fastB]) {
+    if (!fastB_pwu_ && idx_fastB_ < this->rpucuda_device_vec_.size() && 
+        this->rpucuda_device_vec_[idx_fastB_]) {
       auto* devB = dynamic_cast<PulsedRPUDeviceCudaBase<T>*>(
-          this->rpucuda_device_vec_[par.idx_fastB].get());
+          this->rpucuda_device_vec_[idx_fastB_].get());
       if (devB) {
         fastB_pwu_ = std::make_unique<PulsedWeightUpdater<T>>(this->context_, this->x_size_, this->d_size_);
         if (getenv("AIHWKIT_DEBUG_LRTT")) {
@@ -900,20 +1044,19 @@ void LRTTTransferRPUDeviceCuda<T>::populateFrom(const AbstractRPUDevice<T> &rpu_
   }
   
   // Validate transfer cadence for LR-TT
-  const auto& par = getPar();
-  if (par.update_rule == LRUpdateRule::LR_TT) {
-    if (par.transfer_every <= 0) {
+  if (update_rule_ == LRUpdateRule::LR_TT) {
+    if (transfer_every_ <= 0) {
       RPU_WARNING("LR-TT: transfer_every <= 0 disables periodic transfers. "
                   "This is acceptable for inference-only scenarios but breaks the "
-                  "'always pulsed' guarantee during training. Current value: " << par.transfer_every);
+                  "'always pulsed' guarantee during training. Current value: " << transfer_every_);
     }
     if (par.n_reads_per_transfer > 0) {
       RPU_FATAL("LR-TT requires n_reads_per_transfer == 0 (parent read-based transfer is disabled). "
                 "Current value: " << par.n_reads_per_transfer);
     }
     if (getenv("AIHWKIT_DEBUG_LRTT")) {
-      printf("[LR-TT CUDA] Transfer validation: transfer_every=%d, n_reads_per_transfer=%d\n",
-             par.transfer_every, par.n_reads_per_transfer);
+      printf("[LR-TT CUDA] Transfer validation: transfer_every=%f, n_reads_per_transfer=%d\n",
+             (float)transfer_every_, par.n_reads_per_transfer);
     }
   }
   
@@ -935,6 +1078,12 @@ void LRTTTransferRPUDeviceCuda<T>::populateFrom(const AbstractRPUDevice<T> &rpu_
     reinitFastTiles(this->context_->getStream());
     if (getenv("AIHWKIT_DEBUG_LRTT")) {
       printf("[LR-TT CUDA] Initial reinit complete: A=0, B~Kaiming\n");
+      
+      // Check if weights were actually initialized
+      T a_norm = 0, b_norm = 0;
+      RPU::math::nrm2<T>(this->context_, this->size_, dev_w_a_, 1, &a_norm);
+      RPU::math::nrm2<T>(this->context_, this->size_, dev_w_b_, 1, &b_norm);
+      printf("[LR-TT CUDA] After initial reinit: A norm=%.8e, B norm=%.8e\n", (float)a_norm, (float)b_norm);
     }
   }
 }
@@ -944,28 +1093,25 @@ void LRTTTransferRPUDeviceCuda<T>::initializeDevicePointers() {
   // Get device weight pointers from the weight storage
   // The parent VectorRPUDeviceCuda stores all weights in dev_weights_vec_
   // Each device's weights are stored contiguously with size this->size_
-  
-  const auto& par = getPar();
-  
   // Each device has this->size_ elements in the weight vector
   // int device_size = this->size_;  // Unused, commented out to avoid warnings
   
   // Use dev_weights_ptrs_ array for robustness
   if (!this->dev_weights_ptrs_.empty()) {
     // Get pointers from the pre-computed array
-    if (par.idx_visible >= 0 && par.idx_visible < (int)this->dev_weights_ptrs_.size()) {
-      dev_w_visible_ = this->dev_weights_ptrs_[par.idx_visible];
+    if (idx_visible_ >= 0 && idx_visible_ < (int)this->dev_weights_ptrs_.size()) {
+      dev_w_visible_ = this->dev_weights_ptrs_[idx_visible_];
       // CRITICAL: Ensure the pointer array always reflects our current visible pointer
       // This is needed for reduceToWeights to work correctly after transfer
-      this->dev_weights_ptrs_[par.idx_visible] = dev_w_visible_;
+      this->dev_weights_ptrs_[idx_visible_] = dev_w_visible_;
     }
     
-    if (par.idx_fastA >= 0 && par.idx_fastA < (int)this->dev_weights_ptrs_.size()) {
-      dev_w_a_ = this->dev_weights_ptrs_[par.idx_fastA];
+    if (idx_fastA_ >= 0 && idx_fastA_ < (int)this->dev_weights_ptrs_.size()) {
+      dev_w_a_ = this->dev_weights_ptrs_[idx_fastA_];
     }
     
-    if (par.idx_fastB >= 0 && par.idx_fastB < (int)this->dev_weights_ptrs_.size()) {
-      dev_w_b_ = this->dev_weights_ptrs_[par.idx_fastB];
+    if (idx_fastB_ >= 0 && idx_fastB_ < (int)this->dev_weights_ptrs_.size()) {
+      dev_w_b_ = this->dev_weights_ptrs_[idx_fastB_];
     }
   } else {
     // Weights not yet allocated - will be set later
@@ -1006,8 +1152,7 @@ void LRTTTransferRPUDeviceCuda<T>::runUpdateKernel(
     const ChoppedWeightOutput<T> *cwo) {
   
   // Validate preconditions for LR-TT operation
-  const auto &par = this->getPar();
-  if (par.update_rule != LRUpdateRule::LR_TT) {
+  if (update_rule_ != LRUpdateRule::LR_TT) {
     RPU_FATAL("LRTTTransferRPUDeviceCuda requires update_rule == LR_TT");
   }
   if (rank_ <= 0) {
@@ -1016,7 +1161,7 @@ void LRTTTransferRPUDeviceCuda<T>::runUpdateKernel(
   
   // Handle fully hidden case FIRST (before sync)
   if (this->fully_hidden_) {
-    this->dev_weights_ptrs_[par.idx_visible] = dev_weights;
+    this->dev_weights_ptrs_[idx_visible_] = dev_weights;
     dev_w_visible_ = dev_weights;  // Ensure consistent buffer usage in transfer path
   }
   
@@ -1075,15 +1220,15 @@ void LRTTTransferRPUDeviceCuda<T>::runUpdateKernel(
     configurePulseType(up_local, PulseType::StochasticCompressed);
     
     // Apply A/B update BL management settings from Python config
-    up_local.update_bl_management = par.ab_use_bl_management;
-    up_local.update_management = par.ab_use_update_management;
-    if (par.ab_desired_bl > 0) {
-      up_local.desired_BL = par.ab_desired_bl;
+    up_local.update_bl_management = ab_use_bl_management_;
+    up_local.update_management = ab_use_update_management_;
+    if (ab_desired_bl_ > 0) {
+      up_local.desired_BL = ab_desired_bl_;
     } // else keep device default
     
     // Apply gradient magnitude correction if enabled (for pulsed path)
     T lr_scaled = lr;
-    if (par.correct_gradient_magnitudes && rank_ > 0) {
+    if (correct_gradient_magnitudes_ && rank_ > 0) {
       // Scale learning rate by std::sqrt(rank) to correct for low-rank gradient magnitudes
       T correction = std::sqrt((T)rank_);
       lr_scaled = lr * correction;
@@ -1095,12 +1240,10 @@ void LRTTTransferRPUDeviceCuda<T>::runUpdateKernel(
     
     // Use the pulsed LoRA update with scaled LR
     doLoRAPulsedUpdate_(x_in, d_in, lr_scaled, m_batch, up_local, up_context);
-    num_a_updates_++;
-    num_b_updates_++;
     
     // Handle transfer scheduling (same as in direct path)
-    int transfer_every = par.transfer_every;
-    if (par.units_in_mbatch) {
+    int transfer_every = transfer_every_;
+    if (units_in_mbatch_) {
       transfer_every *= m_batch;
     }
     
@@ -1136,11 +1279,10 @@ void LRTTTransferRPUDeviceCuda<T>::doTransfer(cudaStream_t stream) {
   }
   
   // Debug output
-  DEBUG_OUT("LRTT doTransfer called! transfer_lr=" << getPar().transfer_lr << ", rank=" << rank_);
+  DEBUG_OUT("LRTT doTransfer called! transfer_lr=" << transfer_lr_ << ", rank=" << rank_);
   
-  // Apply the outer product update
-  const auto& par = getPar();
-  applyABOuterAsPulsedUpdate(par.transfer_lr, stream);
+  // Apply the outer product update using the stored transfer_lr
+  applyABOuterAsPulsedUpdate(transfer_lr_, stream);
   
   // Note: reinitFastTiles is now called inside applyABOuterAsPulsedUpdate
   // with proper stream ordering to avoid races
@@ -1166,7 +1308,6 @@ void LRTTTransferRPUDeviceCuda<T>::applyABOuterAsPulsedUpdate(T lr_scale, cudaSt
   cudaStream_t ctx_s = this->context_->getStream();
   const bool cross_stream = (ctx_s != s);
   
-  const auto& par = getPar();
   // Only pulsed stochastic updates are used (no digital bypass)
   
   // Fix B: Create events for stream synchronization
@@ -1185,20 +1326,20 @@ void LRTTTransferRPUDeviceCuda<T>::applyABOuterAsPulsedUpdate(T lr_scale, cudaSt
   configurePulseType(up, PulseType::StochasticCompressed);
   
   // Apply transfer-specific BL management settings from Python config
-  up.update_bl_management = par.transfer_use_bl_management;
-  up.update_management = par.transfer_use_update_management;
-  if (par.transfer_desired_bl > 0) {
-    up.desired_BL = par.transfer_desired_bl;
+  up.update_bl_management = transfer_use_bl_management_;
+  up.update_management = transfer_use_update_management_;
+  if (transfer_desired_bl_ > 0) {
+    up.desired_BL = transfer_desired_bl_;
   } // else keep device default
 
-  const int chunk = (par.rank_chunk > 0) ? par.rank_chunk : std::min(K, 256);
+  const int chunk = (rank_chunk_ > 0) ? rank_chunk_ : std::min(K, 256);
   const int threads = 256;
 
-  auto* devVis = (par.idx_visible < this->rpucuda_device_vec_.size())
-    ? dynamic_cast<PulsedRPUDeviceCudaBase<T>*>(this->rpucuda_device_vec_[par.idx_visible].get()) : nullptr;
+  auto* devVis = (idx_visible_ < this->rpucuda_device_vec_.size())
+    ? dynamic_cast<PulsedRPUDeviceCudaBase<T>*>(this->rpucuda_device_vec_[idx_visible_].get()) : nullptr;
   if (!devVis) {
     std::ostringstream ss;
-    ss << "LR-TT transfer requires pulsed visible tile (idx_visible=" << par.idx_visible << ").";
+    ss << "LR-TT transfer requires pulsed visible tile (idx_visible=" << idx_visible_ << ").";
     RPU_FATAL(ss.str().c_str());
   }
   
@@ -1209,8 +1350,16 @@ void LRTTTransferRPUDeviceCuda<T>::applyABOuterAsPulsedUpdate(T lr_scale, cudaSt
   // PWU computes: W += -lr * D @ X^T
   // We want: W += transfer_lr * A @ B
   // With StochasticCompressed + UBLM, we need positive LR for valid sqrt(lr_div_dwmin/K)
+  // IMPORTANT: Sign flip explanation for pulsed updates
+  // The pulsed weight updater expects: W += lr * X @ D^T
+  // But we want the transfer: W_visible += lr_scale * A @ B
+  // 
+  // Problem: If lr_scale is negative, UBLM's sqrt(lr) would fail.
   // Solution: Use positive LR and flip D's sign to compensate
-  // PWU: W += -lr * (-A_chunk) @ B_chunk = +lr * A_chunk @ B_chunk
+  // PWU: W += -lr * X @ (-D)^T = +lr * X @ D^T (achieves the desired negative transfer)
+  // 
+  // Therefore: We use lr_eff = |lr_scale| (always positive for UBLM)
+  // And if lr_scale < 0, we negate D_chunk before the pulsed update
   const T lr_eff = (T)std::abs((double)lr_scale);  // Ensure positive for UBLM sqrt
 
   if (getenv("AIHWKIT_DEBUG_LRTT")) {
@@ -1307,11 +1456,10 @@ void LRTTTransferRPUDeviceCuda<T>::reinitFastTiles(cudaStream_t stream) {
   }
 
   // Get device pointers for A and B
-  const auto& par = getPar();
-  auto* devA = (par.idx_fastA < this->rpucuda_device_vec_.size())
-    ? this->rpucuda_device_vec_[par.idx_fastA].get() : nullptr;
-  auto* devB = (par.idx_fastB < this->rpucuda_device_vec_.size())
-    ? this->rpucuda_device_vec_[par.idx_fastB].get() : nullptr;
+  auto* devA = (idx_fastA_ < this->rpucuda_device_vec_.size())
+    ? this->rpucuda_device_vec_[idx_fastA_].get() : nullptr;
+  auto* devB = (idx_fastB_ < this->rpucuda_device_vec_.size())
+    ? this->rpucuda_device_vec_[idx_fastB_].get() : nullptr;
 
   // --- Zero A entirely (safe & simple) -> ensures A_lr == 0
   const int nA_full = d * x;
@@ -1330,13 +1478,12 @@ void LRTTTransferRPUDeviceCuda<T>::reinitFastTiles(cudaStream_t stream) {
 
   // --- Kaiming(He) init for B_lr = first K rows of B
   // Fan-in for a row-wise linear map B_lr (K×x) applied to X (x×mb) is 'x'.
-  static unsigned long long reinit_counter = 0;
-  reinit_counter++;
+  reinit_counter_++;
   unsigned long long seed =
-      ((unsigned long long)(uintptr_t)dev_w_b_ ^ reinit_counter) +
+      ((unsigned long long)(uintptr_t)dev_w_b_ ^ reinit_counter_) +
       (unsigned long long)std::rand();
 
-  const T std_dev_B = getPar().reinit_gain * std::sqrt((T)2.0 / (T)x);
+  const T std_dev_B = reinit_gain_ * std::sqrt((T)2.0 / (T)x);
 
   const int nB_lr = K * x;
   const int blocks_B_lr = (nB_lr + threads - 1) / threads;
@@ -1391,8 +1538,7 @@ void LRTTTransferRPUDeviceCuda<T>::doDirectUpdate(
   
   // Handle fully hidden case FIRST (before sync)
   if (this->fully_hidden_) {
-    const auto& par = this->getPar();
-    this->dev_weights_ptrs_[par.idx_visible] = dev_weights;
+    this->dev_weights_ptrs_[idx_visible_] = dev_weights;
     dev_w_visible_ = dev_weights;  // Ensure consistent buffer usage in transfer path
   }
   
@@ -1416,10 +1562,8 @@ void LRTTTransferRPUDeviceCuda<T>::doDirectUpdate(
     printf("[LR-TT DEBUG] update path: NONE->direct\n");
   }
   
-  const auto& par = getPar();
-  
   // Check if we should use LoRA-style updates
-  if (par.update_rule == LRUpdateRule::LR_TT) {
+  if (update_rule_ == LRUpdateRule::LR_TT) {
     // LR-TT MUST use pulsed path to maintain "always pulsed" guarantee
     if (getenv("AIHWKIT_DEBUG_LRTT")) {
       printf("[LR-TT DEBUG] Using pulsed LoRA updates (LR_TT mode - always pulsed)\n");
@@ -1428,25 +1572,22 @@ void LRTTTransferRPUDeviceCuda<T>::doDirectUpdate(
     // Configure pulse type and apply A/B update BL management settings
     auto up_local = up;
     configurePulseType(up_local, PulseType::StochasticCompressed);
-    up_local.update_bl_management = par.ab_use_bl_management;
-    up_local.update_management = par.ab_use_update_management;
-    if (par.ab_desired_bl > 0) {
-      up_local.desired_BL = par.ab_desired_bl;
+    up_local.update_bl_management = ab_use_bl_management_;
+    up_local.update_management = ab_use_update_management_;
+    if (ab_desired_bl_ > 0) {
+      up_local.desired_BL = ab_desired_bl_;
     } // else keep device default
     
     // Use pulsed LoRA update - NOT the GEMM-based doLoRAUpdate
     doLoRAPulsedUpdate_(x_in, d_in, lr, m_batch, up_local, this->context_);
-    num_a_updates_++;
-    num_b_updates_++;
   } else {
     // Legacy behavior path (deprecated)
     // 1. Update fast device A directly
-    if (this->rpucuda_device_vec_[par.idx_fastA]) {
+    if (this->rpucuda_device_vec_[idx_fastA_]) {
       // Call the sub-device's doDirectUpdate directly
-      this->rpucuda_device_vec_[par.idx_fastA]->doDirectUpdate(
-          x_in, d_in, this->dev_weights_ptrs_[par.idx_fastA], lr, m_batch, 
+      this->rpucuda_device_vec_[idx_fastA_]->doDirectUpdate(
+          x_in, d_in, this->dev_weights_ptrs_[idx_fastA_], lr, m_batch, 
           x_trans, d_trans, beta, up, x_buffer, d_buffer);
-      num_a_updates_++;
       
       if (getenv("AIHWKIT_DEBUG_LRTT")) {
 #ifndef RPU_USE_FP16
@@ -1466,12 +1607,11 @@ void LRTTTransferRPUDeviceCuda<T>::doDirectUpdate(
     }
     
     // 2. Update fast device B directly (with transposed semantics - swap_x_d=true)
-    if (this->rpucuda_device_vec_[par.idx_fastB]) {
+    if (this->rpucuda_device_vec_[idx_fastB_]) {
       // For B, we swap the input vectors to get transpose semantics (equivalent to swap_x_d=true)
-      this->rpucuda_device_vec_[par.idx_fastB]->doDirectUpdate(
-          d_in, x_in, this->dev_weights_ptrs_[par.idx_fastB], lr, m_batch,
+      this->rpucuda_device_vec_[idx_fastB_]->doDirectUpdate(
+          d_in, x_in, this->dev_weights_ptrs_[idx_fastB_], lr, m_batch,
           d_trans, x_trans, beta, up, d_buffer, x_buffer);
-      num_b_updates_++;
       
       if (getenv("AIHWKIT_DEBUG_LRTT")) {
 #ifndef RPU_USE_FP16
@@ -1492,8 +1632,8 @@ void LRTTTransferRPUDeviceCuda<T>::doDirectUpdate(
   }
   
   // 3. Transfer scheduling using increment-then-compare
-  int transfer_every = par.transfer_every;
-  if (par.units_in_mbatch) {
+  int transfer_every = transfer_every_;
+  if (units_in_mbatch_) {
     transfer_every *= m_batch;
   }
   
@@ -1505,8 +1645,8 @@ void LRTTTransferRPUDeviceCuda<T>::doDirectUpdate(
     }
     
     // For LR-TT, use pulsed transfer; for legacy path use GEMM fallback
-    if (rank_ > 0 && par.transfer_lr != 0) {
-      if (par.update_rule == LRUpdateRule::LR_TT) {
+    if (rank_ > 0 && transfer_lr_ != 0) {
+      if (update_rule_ == LRUpdateRule::LR_TT) {
         // LR-TT: Use pulsed transfer to maintain "always pulsed" guarantee
         doTransfer(this->context_->getStream());
         num_transfers_++;
@@ -1536,7 +1676,7 @@ void LRTTTransferRPUDeviceCuda<T>::doDirectUpdate(
             this->d_size_,      // M
             this->x_size_,      // N
             rank_,              // K
-            par.transfer_lr,    // alpha
+            transfer_lr_,       // alpha
             dev_temp_d_->getData(), // A
             this->d_size_,      // lda (col-major: A_lr is [d_size, K], so ld = d_size)
             dev_temp_x_->getData(), // B
@@ -1562,7 +1702,7 @@ void LRTTTransferRPUDeviceCuda<T>::doDirectUpdate(
           printf("[LR-TT DIRECT] After transfer: ||W||_F = %.6e\n", (float)norm_w);
         }
       }  // end else (legacy path)
-    }  // end if (rank_ > 0 && par.transfer_lr != 0)
+    }  // end if (rank_ > 0 && transfer_lr_ != 0)
   }
   
   // 4. Wait for any pending visible sync before reducing to aggregated weights
@@ -1581,12 +1721,11 @@ pwukpvec_t<T> LRTTTransferRPUDeviceCuda<T>::getUpdateKernels(
     const PulsedUpdateMetaParameter<T> &up) {
   
   // Use fast A device for kernel selection (not device 0)
-  const auto& par = getPar();
   pwukpvec_t<T> v;
   
   // Calculate chunking for transfer scheduling
-  int transfer_every = par.transfer_every;
-  if (par.units_in_mbatch) {
+  int transfer_every = transfer_every_;
+  if (units_in_mbatch_) {
     transfer_every *= m_batch;
   }
   
@@ -1595,7 +1734,7 @@ pwukpvec_t<T> LRTTTransferRPUDeviceCuda<T>::getUpdateKernels(
   int chunk_size = (m_batch + nchunks - 1) / nchunks;
   
   // Get kernels from fast A device
-  v = this->rpucuda_device_vec_[par.idx_fastA]->getUpdateKernels(
+  v = this->rpucuda_device_vec_[idx_fastA_]->getUpdateKernels(
       chunk_size, nK32, use_bo64, out_trans, up);
   
   if (nchunks > 1) {
@@ -1642,8 +1781,6 @@ void LRTTTransferRPUDeviceCuda<T>::doLoRAUpdate(
     cudaStream_t stream,
     const T beta) {
   
-  const auto& par = getPar();
-  
   // Edge case: skip if rank is 0 or lr is 0
   if (rank_ <= 0 || lr == (T)0.0) {
     if (getenv("AIHWKIT_DEBUG_LRTT")) {
@@ -1659,6 +1796,13 @@ void LRTTTransferRPUDeviceCuda<T>::doLoRAUpdate(
   
   if (!stream) {
     stream = this->context_->getStream();
+  }
+  
+  // Set the context to use the same stream to avoid cross-stream hazards
+  bool switched = false;
+  if (stream != this->context_->getStream()) {
+    this->context_->setExternalStream(stream);
+    switched = true;
   }
   
   // Ensure scratch buffers are allocated
@@ -1787,6 +1931,11 @@ void LRTTTransferRPUDeviceCuda<T>::doLoRAUpdate(
     printf("[LR-TT LoRA] After update: ||A[:,:K]||_F = %.6e, ||B[:K,:]||_F = %.6e\n", 
            (float)norm_a, (float)norm_b);
   }
+  
+  // Restore the original stream if we switched it
+  if (switched) {
+    this->context_->releaseExternalStream();
+  }
 }
 
 // Step-2: Pulsed LoRA update implementation (always enabled, no more compile guards)
@@ -1809,11 +1958,10 @@ void LRTTTransferRPUDeviceCuda<T>::doLoRAPulsedUpdate_(
   configurePulseType(up, PulseType::StochasticCompressed);
   
   // Apply A/B update BL management settings from Python config
-  const auto& par = getPar();
-  up.update_bl_management = par.ab_use_bl_management;
-  up.update_management = par.ab_use_update_management;
-  if (par.ab_desired_bl > 0) {
-    up.desired_BL = par.ab_desired_bl;
+  up.update_bl_management = ab_use_bl_management_;
+  up.update_management = ab_use_update_management_;
+  if (ab_desired_bl_ > 0) {
+    up.desired_BL = ab_desired_bl_;
   } // else keep device default
 
   cudaStream_t s = up_context ? up_context->getStream() : this->context_->getStream();
@@ -1838,6 +1986,14 @@ void LRTTTransferRPUDeviceCuda<T>::doLoRAPulsedUpdate_(
 
   // 2) Compute projections: X_B = B_lr * X, D_A = A_lr^T * D
   ensureScratchBuffers(m_batch); // alloc rank×mb buffers
+  
+  if (getenv("AIHWKIT_DEBUG_LRTT")) {
+    // Check B_lr before projection
+    T b_lr_norm = 0;
+    RPU::math::nrm2<T>(this->context_, K * this->x_size_, dev_temp_x_->getData(), 1, &b_lr_norm);
+    printf("  B_lr (for projection) norm: %.8e\n", (float)b_lr_norm);
+  }
+  
   RPU::math::gemm<T>(this->context_, false, false,
       K, m_batch, this->x_size_, (T)1.0,
       dev_temp_x_->getData(), K, x_in, this->x_size_,
@@ -1847,6 +2003,14 @@ void LRTTTransferRPUDeviceCuda<T>::doLoRAPulsedUpdate_(
       K, m_batch, this->d_size_, (T)1.0,
       dev_temp_d_->getData(), this->d_size_, d_in, this->d_size_,
       (T)0.0, dev_da_mb_->getData(), K); // D_A
+  
+  if (getenv("AIHWKIT_DEBUG_LRTT")) {
+    // Check projections after computation
+    T xb_norm = 0, da_norm = 0;
+    RPU::math::nrm2<T>(this->context_, K * m_batch, dev_xb_mb_->getData(), 1, &xb_norm);
+    RPU::math::nrm2<T>(this->context_, K * m_batch, dev_da_mb_->getData(), 1, &da_norm);
+    printf("  X_B projection norm: %.8e, D_A projection norm: %.8e\n", (float)xb_norm, (float)da_norm);
+  }
 
   // 3) Route to LR rows via padded buffers (top-K rows)
   ensurePaddedBuffers(m_batch);
@@ -1870,31 +2034,74 @@ void LRTTTransferRPUDeviceCuda<T>::doLoRAPulsedUpdate_(
   if (!fastA_pwu_) fastA_pwu_ = std::make_unique<PulsedWeightUpdater<T>>(this->context_, this->x_size_, this->d_size_);
   if (!fastB_pwu_) fastB_pwu_ = std::make_unique<PulsedWeightUpdater<T>>(this->context_, this->x_size_, this->d_size_);
 
-  const auto& fast_par = getPar();
-  auto* devA = (fast_par.idx_fastA < this->rpucuda_device_vec_.size())
-    ? dynamic_cast<PulsedRPUDeviceCudaBase<T>*>(this->rpucuda_device_vec_[fast_par.idx_fastA].get()) : nullptr;
-  auto* devB = (fast_par.idx_fastB < this->rpucuda_device_vec_.size())
-    ? dynamic_cast<PulsedRPUDeviceCudaBase<T>*>(this->rpucuda_device_vec_[fast_par.idx_fastB].get()) : nullptr;
+  auto* devA = (idx_fastA_ < this->rpucuda_device_vec_.size())
+    ? dynamic_cast<PulsedRPUDeviceCudaBase<T>*>(this->rpucuda_device_vec_[idx_fastA_].get()) : nullptr;
+  auto* devB = (idx_fastB_ < this->rpucuda_device_vec_.size())
+    ? dynamic_cast<PulsedRPUDeviceCudaBase<T>*>(this->rpucuda_device_vec_[idx_fastB_].get()) : nullptr;
 
   if (devA) {
     if (getenv("AIHWKIT_DEBUG_LRTT")) {
-      printf("[LR-TT DEBUG] Updating A device (idx=%d), lr=%.6e\n", fast_par.idx_fastA, (float)lr);
+      printf("[LR-TT DEBUG] Updating A device (idx=%d), lr=%.6e\n", idx_fastA_, (float)lr);
+      
+      // Check A weights before update
+      T w_a_before_norm = 0;
+      RPU::math::nrm2<T>(this->context_, this->size_, dev_w_a_, 1, &w_a_before_norm);
+      printf("  A weights before update: norm=%.8e\n", (float)w_a_before_norm);
+      
+      // Check X_B (padded input)
+      T x_pad_norm = 0;
+      RPU::math::nrm2<T>(this->context_, this->d_size_ * m_batch, dev_x_pad_->getData(), 1, &x_pad_norm);
+      printf("  X_B (padded) norm: %.8e\n", (float)x_pad_norm);
+      
+      // Check D (original gradient)
+      T d_norm = 0;
+      RPU::math::nrm2<T>(this->context_, this->d_size_ * m_batch, d_in, 1, &d_norm);
+      printf("  D (gradient) norm: %.8e\n", (float)d_norm);
     }
     num_a_updates_++;
     fastA_pwu_->update(
         dev_x_pad_->getData(),  // X = padded X_B (rank rows)
         d_in,                   // D = original D
         dev_w_a_, devA, up, lr, m_batch, /*x_trans=*/false, /*d_trans=*/false);
+    
+    if (getenv("AIHWKIT_DEBUG_LRTT")) {
+      // Check A weights after update
+      T w_a_after_norm = 0;
+      RPU::math::nrm2<T>(this->context_, this->size_, dev_w_a_, 1, &w_a_after_norm);
+      printf("  A weights after update: norm=%.8e\n", (float)w_a_after_norm);
+    }
   }
   if (devB) {
     if (getenv("AIHWKIT_DEBUG_LRTT")) {
-      printf("[LR-TT DEBUG] Updating B device (idx=%d), lr=%.6e\n", fast_par.idx_fastB, (float)lr);
+      printf("[LR-TT DEBUG] Updating B device (idx=%d), lr=%.6e\n", idx_fastB_, (float)lr);
+      
+      // Check B weights before update
+      T w_b_before_norm = 0;
+      RPU::math::nrm2<T>(this->context_, this->size_, dev_w_b_, 1, &w_b_before_norm);
+      printf("  B weights before update: norm=%.8e\n", (float)w_b_before_norm);
+      
+      // Check X (original input)
+      T x_norm = 0;
+      RPU::math::nrm2<T>(this->context_, this->x_size_ * m_batch, x_in, 1, &x_norm);
+      printf("  X (input) norm: %.8e\n", (float)x_norm);
+      
+      // Check D_A (padded gradient)
+      T d_pad_norm = 0;
+      RPU::math::nrm2<T>(this->context_, this->d_size_ * m_batch, dev_d_pad_->getData(), 1, &d_pad_norm);
+      printf("  D_A (padded) norm: %.8e\n", (float)d_pad_norm);
     }
     num_b_updates_++;
     fastB_pwu_->update(
         x_in,                   // X = original X
         dev_d_pad_->getData(),  // D = padded D_A (rank rows)
         dev_w_b_, devB, up, lr, m_batch, /*x_trans=*/false, /*d_trans=*/false);
+    
+    if (getenv("AIHWKIT_DEBUG_LRTT")) {
+      // Check B weights after update  
+      T w_b_after_norm = 0;
+      RPU::math::nrm2<T>(this->context_, this->size_, dev_w_b_, 1, &w_b_after_norm);
+      printf("  B weights after update: norm=%.8e\n", (float)w_b_after_norm);
+    }
   }
   
   // Restore original stream if we switched it
@@ -1914,20 +2121,31 @@ void LRTTTransferRPUDeviceCuda<T>::dumpExtra(RPU::state_t &extra, const std::str
   
   // Save LRTT-specific parameters
   RPU::insert(state, "rank", rank_);
+  RPU::insert(state, "transfer_lr", transfer_lr_);
+  RPU::insert(state, "transfer_every", transfer_every_);
+  RPU::insert(state, "units_in_mbatch", units_in_mbatch_);
+  RPU::insert(state, "n_reads_per_transfer", n_reads_per_transfer_);
+  RPU::insert(state, "ab_use_bl_management", ab_use_bl_management_);
+  RPU::insert(state, "ab_use_update_management", ab_use_update_management_);
+  RPU::insert(state, "ab_desired_bl", ab_desired_bl_);
+  RPU::insert(state, "transfer_use_bl_management", transfer_use_bl_management_);
+  RPU::insert(state, "transfer_use_update_management", transfer_use_update_management_);
+  RPU::insert(state, "transfer_desired_bl", transfer_desired_bl_);
   RPU::insert(state, "transfer_counter", transfer_counter_);
   RPU::insert(state, "num_a_updates", num_a_updates_);
   RPU::insert(state, "num_b_updates", num_b_updates_);
   RPU::insert(state, "num_transfers", num_transfers_);
   
   // Save meta parameters that affect forward pass
-  const auto &par = getPar();
-  RPU::insert(state, "forward_inject", par.forward_inject);
-  RPU::insert(state, "lora_alpha", par.lora_alpha);
-  RPU::insert(state, "idx_fastA", par.idx_fastA);
-  RPU::insert(state, "idx_fastB", par.idx_fastB);
-  RPU::insert(state, "idx_visible", par.idx_visible);
-  RPU::insert(state, "rank_chunk", par.rank_chunk);
-  RPU::insert(state, "rank_offset", par.rank_offset);
+  RPU::insert(state, "forward_inject", forward_inject_);
+  RPU::insert(state, "lora_alpha", lora_alpha_);
+  RPU::insert(state, "idx_fastA", idx_fastA_);
+  RPU::insert(state, "idx_fastB", idx_fastB_);
+  RPU::insert(state, "idx_visible", idx_visible_);
+  RPU::insert(state, "rank_chunk", rank_chunk_);
+  RPU::insert(state, "correct_gradient_magnitudes", correct_gradient_magnitudes_);
+  RPU::insert(state, "reinit_gain", reinit_gain_);
+  RPU::insert(state, "update_rule", (int)update_rule_);
   
   // Insert with prefix
   RPU::insertWithPrefix(extra, state, prefix);
@@ -1943,20 +2161,36 @@ void LRTTTransferRPUDeviceCuda<T>::loadExtra(const RPU::state_t &extra, const st
   
   // Load LRTT-specific parameters
   RPU::load(state, "rank", rank_, strict);
+  RPU::load(state, "transfer_lr", transfer_lr_, strict);
+  RPU::load(state, "transfer_every", transfer_every_, strict);
+  RPU::load(state, "units_in_mbatch", units_in_mbatch_, strict);
+  RPU::load(state, "n_reads_per_transfer", n_reads_per_transfer_, strict);
+  RPU::load(state, "ab_use_bl_management", ab_use_bl_management_, strict);
+  RPU::load(state, "ab_use_update_management", ab_use_update_management_, strict);
+  RPU::load(state, "ab_desired_bl", ab_desired_bl_, strict);
+  RPU::load(state, "transfer_use_bl_management", transfer_use_bl_management_, strict);
+  RPU::load(state, "transfer_use_update_management", transfer_use_update_management_, strict);
+  RPU::load(state, "transfer_desired_bl", transfer_desired_bl_, strict);
   RPU::load(state, "transfer_counter", transfer_counter_, strict);
   RPU::load(state, "num_a_updates", num_a_updates_, strict);
   RPU::load(state, "num_b_updates", num_b_updates_, strict);
   RPU::load(state, "num_transfers", num_transfers_, strict);
   
+  // Note: Parameters are already loaded from extra state above
+  // No need to re-fetch from getPar() as we maintain local copies
+  
   // Load meta parameters (non-strict for backward compatibility)
-  auto &par = getPar();
-  RPU::load(state, "forward_inject", par.forward_inject, false);
-  RPU::load(state, "lora_alpha", par.lora_alpha, false);
-  RPU::load(state, "idx_fastA", par.idx_fastA, false);
-  RPU::load(state, "idx_fastB", par.idx_fastB, false);
-  RPU::load(state, "idx_visible", par.idx_visible, false);
-  RPU::load(state, "rank_chunk", par.rank_chunk, false);
-  RPU::load(state, "rank_offset", par.rank_offset, false);
+  RPU::load(state, "forward_inject", forward_inject_, false);
+  RPU::load(state, "lora_alpha", lora_alpha_, false);
+  RPU::load(state, "idx_fastA", idx_fastA_, false);
+  RPU::load(state, "idx_fastB", idx_fastB_, false);
+  RPU::load(state, "idx_visible", idx_visible_, false);
+  RPU::load(state, "rank_chunk", rank_chunk_, false);
+  RPU::load(state, "correct_gradient_magnitudes", correct_gradient_magnitudes_, false);
+  RPU::load(state, "reinit_gain", reinit_gain_, false);
+  int temp_update_rule = (int)update_rule_;
+  RPU::load(state, "update_rule", temp_update_rule, false);
+  update_rule_ = (LRUpdateRule)temp_update_rule;
   
   // Re-initialize device pointers after load to ensure consistency
   initializeDevicePointers();
@@ -1992,8 +2226,7 @@ void LRTTTransferRPUDeviceCuda<T>::composeForwardInject(
   const int K = rank_;
   
   // Apply LoRA alpha scaling (caller typically passes base alpha, we multiply by lora_alpha)
-  const auto& par = getPar();
-  T effective_alpha = alpha * par.lora_alpha;
+  T effective_alpha = alpha * lora_alpha_;
   
   if (K <= 0) {
     // Just copy visible weights to out if rank==0
@@ -2040,7 +2273,7 @@ void LRTTTransferRPUDeviceCuda<T>::composeForwardInject(
   if (getenv("AIHWKIT_DEBUG_LRTT")) {
     this->context_->synchronize();
     printf("[LR-TT] composeForwardInject: W_eff = W_visible + %.4f * (A[:,%d] @ B[%d,:]) (base_alpha=%.4f, lora_alpha=%.4f)\n", 
-           (float)effective_alpha, K, K, (float)alpha, (float)par.lora_alpha);
+           (float)effective_alpha, K, K, (float)alpha, (float)lora_alpha_);
   }
 #endif
 }
@@ -2056,13 +2289,11 @@ bool LRTTTransferRPUDeviceCuda<T>::forwardWithAnalogInject(
     const bool out_trans,
     const bool transposed) {
 
-  const auto &par = getPar();
-
   // Fallback: if not enabled or invalid rank, use existing visible-only path
-  if (!par.forward_inject || rank_ <= 0) {
+  if (!forward_inject_ || rank_ <= 0) {
     if (std::getenv("AIHWKIT_DEBUG_LRTT")) {
       printf("[LR-TT DEBUG] Fallback path: forward_inject=%d, rank=%d, dev_w_visible_=%p\n",
-             (int)par.forward_inject, rank_, dev_w_visible_);
+             (int)forward_inject_, rank_, dev_w_visible_);
     }
     fb.computeAnalogMVSinglePassPublic(dev_w_visible_, iom, mv_pars, out_trans, transposed);
     return fb.finalizeOutputPublic(out_values, iom, mv_pars, out_trans, transposed);
@@ -2174,12 +2405,12 @@ bool LRTTTransferRPUDeviceCuda<T>::forwardWithAnalogInject(
         iom.getOutBuffer(),            // y
         dev_y_ab_->getData(),          // x
         out_elems,
-        (T)par.lora_alpha);
+        (T)lora_alpha_);
   }
 
 #ifdef AIHWKIT_DEBUG_LRTT
   if (getenv("AIHWKIT_DEBUG_LRTT")) {
-    printf("[LR-TT FWD-INJECT] rank=%d, alpha=%.4f\n", rank_, (float)par.lora_alpha);
+    printf("[LR-TT FWD-INJECT] rank=%d, alpha=%.4f\n", rank_, (float)lora_alpha_);
   }
 #endif
 
@@ -2297,6 +2528,29 @@ void LRTTTransferRPUDeviceCuda<T>::copyBLRFrom(const T* src, cudaStream_t stream
   // Unpack compact [r, x] into first r rows of [d_size, x]
   const int blocks = (r * x + threads - 1) / threads;
   kernelUnpackToFirstKRows<<<blocks, threads, 0, s>>>(dev_w_b_, src, d, x, r);
+}
+
+// Helper method implementations
+template <typename T>
+void LRTTTransferRPUDeviceCuda<T>::ensureABScratch_() {
+  const int need_a = this->d_size_ * rank_;
+  const int need_b = rank_ * this->x_size_;
+  if (!dev_temp_d_ || dev_temp_d_->getSize() < need_a) {
+    dev_temp_d_ = std::make_unique<CudaArray<T>>(this->context_, need_a);
+  }
+  if (!dev_temp_x_ || dev_temp_x_->getSize() < need_b) {
+    dev_temp_x_ = std::make_unique<CudaArray<T>>(this->context_, need_b);
+  }
+}
+
+template <typename T>
+void LRTTTransferRPUDeviceCuda<T>::ensurePaddedBuffers(int m_batch) {
+  if (!dev_x_pad_ || dev_x_pad_->getSize() < this->x_size_ * m_batch) {
+    dev_x_pad_ = std::make_unique<CudaArray<T>>(this->context_, this->x_size_ * m_batch);
+  }
+  if (!dev_d_pad_ || dev_d_pad_->getSize() < this->d_size_ * m_batch) {
+    dev_d_pad_ = std::make_unique<CudaArray<T>>(this->context_, this->d_size_ * m_batch);
+  }
 }
 
 // Explicit template instantiations - MUST be at the end after all member definitions

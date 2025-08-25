@@ -89,7 +89,7 @@ class LRTTTransferCompound(TransferCompound):
     """Enable update management for A/B training updates."""
     
     ab_desired_bl: float = -1.0
-    """Desired bound level for A/B training updates (-1 = no override, use device default)."""
+    """Desired bound level fo,r A/B training updates (-1 = no override, use device default)."""
     
     # Transfer step BL management controls (A@B -> visible)
     transfer_use_bl_management: bool = False
