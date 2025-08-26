@@ -216,6 +216,7 @@ public:
 protected:
   // Initialize device pointers
   void initializeDevicePointers();
+  void ensureLazyInit();
   
   // Transfer helpers
   void applyABOuterAsPulsedUpdate(T lr_scale, cudaStream_t stream);
@@ -284,6 +285,9 @@ private:
   
   // Update rule (stored locally to avoid cast issues)
   LRUpdateRule update_rule_ = LRUpdateRule::LR_TT;  // Fixed to LR_TT
+  
+  // Lazy initialization flag for reinit
+  bool need_reinit_ = true;  // Set to true to trigger reinit on first use
   
   // Device weight pointers (no ownership, just references)
   T *dev_w_visible_ = nullptr;

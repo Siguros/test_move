@@ -30,11 +30,7 @@ template <typename T> struct UpdateFunctorConstantStepLargeNoise {
     UNUSED(par_2);
     
     // DEBUG: Check if updates are being called
-    if (threadIdx.x == 0 && blockIdx.x == 0 && n > 0) {
-      if (getenv("AIHWKIT_DEBUG")) {
-        printf("[ConstantStep] Update called: n=%d, negative=%d\n", n, negative);
-      }
-    }
+    // Note: getenv() cannot be called from device code, debug info moved to host side
     
     // negative > 0 means going up here ...
     // here we assume that noise_std_dw>0 at least
@@ -50,9 +46,7 @@ template <typename T> struct UpdateFunctorConstantStepLargeNoise {
       w += dw * ((float)1.0 + stoch_value);
       
       // DEBUG: Print update info
-      if (threadIdx.x == 0 && blockIdx.x == 0 && getenv("AIHWKIT_DEBUG")) {
-        printf("[ConstantStep] Update: n=1, dw=%f, w_before=%f, w_after=%f\n", dw, w - dw * ((float)1.0 + stoch_value), w);
-      }
+      // Note: getenv() cannot be called from device code, debug info moved to host side
 
       w = (w > wmax) ? wmax : w;
       w = (w < wmin) ? wmin : w;

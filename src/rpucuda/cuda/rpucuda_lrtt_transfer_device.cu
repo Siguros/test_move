@@ -638,10 +638,10 @@ LRTTTransferRPUDeviceCuda<T>::LRTTTransferRPUDeviceCuda(
       auto* devA = dynamic_cast<PulsedRPUDeviceCudaBase<T>*>(
           this->rpucuda_device_vec_[idx_fastA_].get());
       if (devA) {
-        // Create PWU for fastA (d_size x x_size for full matrix)
+        // Create PWU for fastA (always use full tile dimensions)
         fastA_pwu_ = std::make_unique<PulsedWeightUpdater<T>>(c, x_size, d_size);
         if (getenv("AIHWKIT_DEBUG_LRTT")) {
-          printf("[LR-TT CUDA] Created PWU for fastA: %dx%d\n", d_size, x_size);
+          printf("[LR-TT CUDA] Created PWU for fastA: %dx%d (full tile dims)\n", d_size, x_size);
         }
       }
     }
@@ -652,10 +652,10 @@ LRTTTransferRPUDeviceCuda<T>::LRTTTransferRPUDeviceCuda(
       auto* devB = dynamic_cast<PulsedRPUDeviceCudaBase<T>*>(
           this->rpucuda_device_vec_[idx_fastB_].get());
       if (devB) {
-        // Create PWU for fastB (d_size x x_size for full matrix)
+        // Create PWU for fastB (always use full tile dimensions)
         fastB_pwu_ = std::make_unique<PulsedWeightUpdater<T>>(c, x_size, d_size);
         if (getenv("AIHWKIT_DEBUG_LRTT")) {
-          printf("[LR-TT CUDA] Created PWU for fastB: %dx%d\n", d_size, x_size);
+          printf("[LR-TT CUDA] Created PWU for fastB: %dx%d (full tile dims)\n", d_size, x_size);
         }
       }
     }
@@ -1025,7 +1025,7 @@ void LRTTTransferRPUDeviceCuda<T>::populateFrom(const AbstractRPUDevice<T> &rpu_
       if (devA) {
         fastA_pwu_ = std::make_unique<PulsedWeightUpdater<T>>(this->context_, this->x_size_, this->d_size_);
         if (getenv("AIHWKIT_DEBUG_LRTT")) {
-          printf("[LR-TT CUDA] populateFrom: Created PWU for fastA\n");
+          printf("[LR-TT CUDA] populateFrom: Created PWU for fastA (%dx%d full tile dims)\n", this->d_size_, this->x_size_);
         }
       }
     }
@@ -1037,7 +1037,7 @@ void LRTTTransferRPUDeviceCuda<T>::populateFrom(const AbstractRPUDevice<T> &rpu_
       if (devB) {
         fastB_pwu_ = std::make_unique<PulsedWeightUpdater<T>>(this->context_, this->x_size_, this->d_size_);
         if (getenv("AIHWKIT_DEBUG_LRTT")) {
-          printf("[LR-TT CUDA] populateFrom: Created PWU for fastB\n");
+          printf("[LR-TT CUDA] populateFrom: Created PWU for fastB (%dx%d full tile dims)\n", this->d_size_, this->x_size_);
         }
       }
     }
@@ -1072,18 +1072,45 @@ void LRTTTransferRPUDeviceCuda<T>::populateFrom(const AbstractRPUDevice<T> &rpu_
            fastA_pwu_ ? "YES" : "NO", fastB_pwu_ ? "YES" : "NO");
   }
   
-  // Initialize B with Kaiming values at the start (A remains 0)
-  // This ensures B is non-zero from the beginning for proper LoRA operation
+  // Set flag for lazy initialization of B with Kaiming values
+  // This will be done on first use when pointers are guaranteed to be ready
   if (rank_ > 0) {
-    reinitFastTiles(this->context_->getStream());
+    need_reinit_ = true;
     if (getenv("AIHWKIT_DEBUG_LRTT")) {
-      printf("[LR-TT CUDA] Initial reinit complete: A=0, B~Kaiming\n");
+      printf("[LR-TT CUDA] Lazy reinit scheduled for first use\n");
+    }
+  }
+}
+
+template <typename T>
+void LRTTTransferRPUDeviceCuda<T>::ensureLazyInit() {
+  if (need_reinit_ && rank_ > 0) {
+    // Check if pointers are ready
+    if (!dev_w_a_ || !dev_w_b_) {
+      initializeDevicePointers();
+    }
+    
+    // If pointers are now ready, perform reinit
+    if (dev_w_a_ && dev_w_b_) {
+      reinitFastTiles(this->context_->getStream());
+      need_reinit_ = false;
       
-      // Check if weights were actually initialized
-      T a_norm = 0, b_norm = 0;
-      RPU::math::nrm2<T>(this->context_, this->size_, dev_w_a_, 1, &a_norm);
-      RPU::math::nrm2<T>(this->context_, this->size_, dev_w_b_, 1, &b_norm);
-      printf("[LR-TT CUDA] After initial reinit: A norm=%.8e, B norm=%.8e\n", (float)a_norm, (float)b_norm);
+      // CRITICAL: Synchronize to ensure reinit completes before any operations on other streams
+      // This prevents race conditions when callers use different streams
+      // Since lazy init only happens once, the performance cost is negligible
+      this->context_->synchronize();
+      
+      if (getenv("AIHWKIT_DEBUG_LRTT")) {
+        printf("[LR-TT CUDA] Lazy reinit complete: A=0, B~Kaiming\n");
+        
+        // Check if weights were actually initialized
+        T a_norm = 0, b_norm = 0;
+        int a_size = this->d_size_ * this->x_size_;
+        int b_size = this->d_size_ * this->x_size_;
+        RPU::math::nrm2<T>(this->context_, a_size, dev_w_a_, 1, &a_norm);
+        RPU::math::nrm2<T>(this->context_, b_size, dev_w_b_, 1, &b_norm);
+        printf("[LR-TT CUDA] After lazy reinit: A norm=%.8e, B norm=%.8e\n", (float)a_norm, (float)b_norm);
+      }
     }
   }
 }
@@ -1150,6 +1177,9 @@ void LRTTTransferRPUDeviceCuda<T>::runUpdateKernel(
     uint32_t *x_counts_chunk,
     uint32_t *d_counts_chunk,
     const ChoppedWeightOutput<T> *cwo) {
+  
+  // Ensure lazy initialization is complete
+  ensureLazyInit();
   
   // Validate preconditions for LR-TT operation
   if (update_rule_ != LRUpdateRule::LR_TT) {
@@ -1350,17 +1380,17 @@ void LRTTTransferRPUDeviceCuda<T>::applyABOuterAsPulsedUpdate(T lr_scale, cudaSt
   // PWU computes: W += -lr * D @ X^T
   // We want: W += transfer_lr * A @ B
   // With StochasticCompressed + UBLM, we need positive LR for valid sqrt(lr_div_dwmin/K)
-  // IMPORTANT: Sign flip explanation for pulsed updates
-  // The pulsed weight updater expects: W += lr * X @ D^T
-  // But we want the transfer: W_visible += lr_scale * A @ B
+  // IMPORTANT: Sign handling for pulsed updates
+  // The pulsed weight updater computes: W += -lr * D @ X^T (gradient descent convention)
+  // We want the transfer: W_visible += transfer_lr * A @ B
   // 
-  // Problem: If lr_scale is negative, UBLM's sqrt(lr) would fail.
-  // Solution: Use positive LR and flip D's sign to compensate
-  // PWU: W += -lr * X @ (-D)^T = +lr * X @ D^T (achieves the desired negative transfer)
-  // 
-  // Therefore: We use lr_eff = |lr_scale| (always positive for UBLM)
-  // And if lr_scale < 0, we negate D_chunk before the pulsed update
-  const T lr_eff = (T)std::abs((double)lr_scale);  // Ensure positive for UBLM sqrt
+  // To achieve this with positive lr (required for UBLM sqrt):
+  // - Use lr_eff = |transfer_lr| (always positive)
+  // - Negate D only when transfer_lr > 0 to get the correct final sign
+  //   * If transfer_lr > 0: W += -lr_eff * (-D) @ X^T = +lr_eff * D @ X^T ✓
+  //   * If transfer_lr < 0: W += -lr_eff * D @ X^T = -lr_eff * D @ X^T ✓
+  const T lr_eff = (T)std::abs((double)lr_scale);  // Always positive for UBLM
+  const bool negate_D = (lr_scale > 0);  // Only negate when transfer_lr is positive
 
   if (getenv("AIHWKIT_DEBUG_LRTT")) {
     printf("[LR-TT] applyABOuterAsPulsedUpdate: K=%d, chunk=%d, lr_scale=%.6e, lr_eff=%.6e (positive for UBLM)\n", 
@@ -1380,10 +1410,12 @@ void LRTTTransferRPUDeviceCuda<T>::applyABOuterAsPulsedUpdate(T lr_scale, cudaSt
     kernelPackColsWithOffset<<<(nD + threads - 1)/threads, threads, 0, s>>>(
         dev_temp_d_->getData(), dev_w_a_, this->d_size_, this->x_size_, cur, off);
     
-    // NEW: Flip sign on D so final update is +lr * (A_chunk @ B_chunk)
-    // This compensates for PWU's inherent minus sign
-    kernelScale1D<<<(nD + threads - 1)/threads, threads, 0, s>>>(
-        dev_temp_d_->getData(), nD, (T)-1);
+    // Conditionally negate D based on transfer_lr sign
+    // Only negate when transfer_lr > 0 to achieve correct final sign
+    if (negate_D) {
+      kernelScale1D<<<(nD + threads - 1)/threads, threads, 0, s>>>(
+          dev_temp_d_->getData(), nD, (T)-1);
+    }
 
     // Pack B_chunk = B[off:off+cur, :] -> dev_temp_x_ [cur × x]
     const int nX = cur * this->x_size_;
@@ -1461,6 +1493,26 @@ void LRTTTransferRPUDeviceCuda<T>::reinitFastTiles(cudaStream_t stream) {
   auto* devB = (idx_fastB_ < this->rpucuda_device_vec_.size())
     ? this->rpucuda_device_vec_[idx_fastB_].get() : nullptr;
 
+  // Check if device pointers are initialized
+  if (!dev_w_a_ || !dev_w_b_) {
+    if (getenv("AIHWKIT_DEBUG_LRTT")) {
+      printf("[LR-TT] reinitFastTiles: Weight pointers not initialized, attempting to initialize\n");
+    }
+    // Try to initialize the device pointers
+    initializeDevicePointers();
+    
+    // If still not initialized, we can't proceed
+    if (!dev_w_a_ || !dev_w_b_) {
+      if (getenv("AIHWKIT_DEBUG_LRTT")) {
+        printf("[LR-TT] reinitFastTiles: Cannot initialize - weight pointers still NULL\n");
+      }
+      if (switched) {
+        this->context_->releaseExternalStream();
+      }
+      return;
+    }
+  }
+
   // --- Zero A entirely (safe & simple) -> ensures A_lr == 0
   const int nA_full = d * x;
   const int blocks_A_full = (nA_full + threads - 1) / threads;
@@ -1535,6 +1587,9 @@ void LRTTTransferRPUDeviceCuda<T>::doDirectUpdate(
     const PulsedUpdateMetaParameter<T> &up,
     T *x_buffer,
     T *d_buffer) {
+  
+  // Ensure lazy initialization is complete
+  ensureLazyInit();
   
   // Handle fully hidden case FIRST (before sync)
   if (this->fully_hidden_) {
@@ -1988,10 +2043,12 @@ void LRTTTransferRPUDeviceCuda<T>::doLoRAPulsedUpdate_(
   ensureScratchBuffers(m_batch); // alloc rank×mb buffers
   
   if (getenv("AIHWKIT_DEBUG_LRTT")) {
-    // Check B_lr before projection
-    T b_lr_norm = 0;
-    RPU::math::nrm2<T>(this->context_, K * this->x_size_, dev_temp_x_->getData(), 1, &b_lr_norm);
-    printf("  B_lr (for projection) norm: %.8e\n", (float)b_lr_norm);
+    // Check B_lr before projection (with safety check)
+    if (dev_temp_x_ && dev_temp_x_->getData() && K > 0 && this->x_size_ > 0) {
+      T b_lr_norm = 0;
+      RPU::math::nrm2<T>(this->context_, K * this->x_size_, dev_temp_x_->getData(), 1, &b_lr_norm);
+      printf("  B_lr (for projection) norm: %.8e\n", (float)b_lr_norm);
+    }
   }
   
   RPU::math::gemm<T>(this->context_, false, false,
@@ -2288,6 +2345,9 @@ bool LRTTTransferRPUDeviceCuda<T>::forwardWithAnalogInject(
     const MVParameterCuda<T> &mv_pars,
     const bool out_trans,
     const bool transposed) {
+
+  // Ensure lazy initialization is complete
+  ensureLazyInit();
 
   // Fallback: if not enabled or invalid rank, use existing visible-only path
   if (!forward_inject_ || rank_ <= 0) {
