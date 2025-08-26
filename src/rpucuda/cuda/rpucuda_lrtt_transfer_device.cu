@@ -178,7 +178,7 @@ __device__ inline double _curand_gauss<double>(curandState_t* states, int idx) {
 // Uses Philox RNG with per-thread initialization - no external state needed
 template <typename T>
 __global__ void kernelKaimingInitFirstKColsStateless(
-    T* W, int d, int x_size, int K, unsigned long long seed, T std) {
+    T* W, int d, int x_size, int K, unsigned long long seed, T stddev) {
   
   int i = blockDim.x * blockIdx.x + threadIdx.x; // 0..(d*K-1)
   int n = d * K;
@@ -192,8 +192,8 @@ __global__ void kernelKaimingInitFirstKColsStateless(
   curandStatePhilox4_32_10_t rng;
   curand_init(seed, /*subsequence=*/(unsigned long long)i, /*offset=*/0ULL, &rng);
   
-  // Generate normal deviate and scale by std (with proper double precision support)
-  T z = std::is_same<T,double>::value ? (T)curand_normal_double(&rng) * std : (T)curand_normal(&rng) * std;
+  // Generate normal deviate and scale by stddev (with proper double precision support)
+  T z = std::is_same<T,double>::value ? (T)curand_normal_double(&rng) * stddev : (T)curand_normal(&rng) * stddev;
   W[idx] = z;
 }
 
@@ -212,7 +212,7 @@ __global__ void kernelZeroFirstKRows(T* W, int d, int x_size, int K) {
 // Stateless Kaiming Normal for first K rows (fill B_lr = B[:K, :])
 template <typename T>
 __global__ void kernelKaimingInitFirstKRowsStateless(
-    T* W, int d, int x_size, int K, unsigned long long seed, T std) {
+    T* W, int d, int x_size, int K, unsigned long long seed, T stddev) {
   // W is [d, x_size] col-major. We fill rows 0..K-1 across all columns.
   int i = blockDim.x * blockIdx.x + threadIdx.x; // 0..(K*x_size-1)
   int n = K * x_size;
@@ -224,8 +224,8 @@ __global__ void kernelKaimingInitFirstKRowsStateless(
   curandStatePhilox4_32_10_t rng;
   curand_init(seed, static_cast<unsigned long long>(i), 0ULL, &rng);
 
-  // Generate normal deviate and scale by std (with proper double precision support)
-  T z = std::is_same<T,double>::value ? (T)curand_normal_double(&rng) * std : (T)curand_normal(&rng) * std;
+  // Generate normal deviate and scale by stddev (with proper double precision support)
+  T z = std::is_same<T,double>::value ? (T)curand_normal_double(&rng) * stddev : (T)curand_normal(&rng) * stddev;
   W[idx] = z;
 }
 
@@ -605,6 +605,7 @@ LRTTTransferRPUDeviceCuda<T>::LRTTTransferRPUDeviceCuda(
   num_b_updates_ = 0;
   num_transfers_ = 0;
   debug_no_host_copies_ = 0;
+  reinit_counter_ = 0;
   
   // Fix A: Reset sync state
   visible_synced_ = false;
@@ -710,6 +711,7 @@ LRTTTransferRPUDeviceCuda<T>::LRTTTransferRPUDeviceCuda(
       num_b_updates_(0),
       num_transfers_(0),
       debug_no_host_copies_(0),
+      reinit_counter_(0),  // Reset counter for new copy
       visible_synced_(false),  // Force re-sync on first use after copy
       last_agg_ptr_(nullptr),
       visible_sync_ev_(nullptr) {  // Never copy event handles
@@ -720,6 +722,9 @@ LRTTTransferRPUDeviceCuda<T>::LRTTTransferRPUDeviceCuda(
   }
   if (other.dev_temp_d_) {
     dev_temp_d_ = RPU::make_unique<CudaArray<T>>(*other.dev_temp_d_);
+  }
+  if (other.dev_temp_x_T_) {
+    dev_temp_x_T_ = RPU::make_unique<CudaArray<T>>(*other.dev_temp_x_T_);
   }
   
   // Copy scratch buffers if they exist
@@ -783,6 +788,7 @@ LRTTTransferRPUDeviceCuda<T>::operator=(const LRTTTransferRPUDeviceCuda<T> &othe
     num_b_updates_ = 0;
     num_transfers_ = 0;
     debug_no_host_copies_ = 0;
+    reinit_counter_ = 0;  // Reset counter
     
     // Destroy existing event if any
     if (visible_sync_ev_) {
@@ -879,6 +885,7 @@ LRTTTransferRPUDeviceCuda<T>::LRTTTransferRPUDeviceCuda(
       reinit_counter_(other.reinit_counter_),
       dev_fb_out_(std::move(other.dev_fb_out_)),
       dev_y_ab_(std::move(other.dev_y_ab_)),
+      dev_temp_x_T_(std::move(other.dev_temp_x_T_)),
       visible_synced_(other.visible_synced_),
       last_agg_ptr_(other.last_agg_ptr_),
       visible_sync_ev_(other.visible_sync_ev_) {  // Transfer event handle
@@ -936,6 +943,8 @@ LRTTTransferRPUDeviceCuda<T>::operator=(LRTTTransferRPUDeviceCuda<T> &&other) no
     debug_no_host_copies_ = other.debug_no_host_copies_;
     dev_fb_out_ = std::move(other.dev_fb_out_);
     dev_y_ab_ = std::move(other.dev_y_ab_);
+    dev_temp_x_T_ = std::move(other.dev_temp_x_T_);
+    reinit_counter_ = other.reinit_counter_;
     
     // Destroy existing event if any, then transfer the handle
     if (visible_sync_ev_) {
@@ -1066,6 +1075,7 @@ void LRTTTransferRPUDeviceCuda<T>::populateFrom(const AbstractRPUDevice<T> &rpu_
   num_b_updates_ = 0;
   num_transfers_ = 0;
   debug_no_host_copies_ = 0;
+  reinit_counter_ = 0;
   
   if (getenv("AIHWKIT_DEBUG_LRTT")) {
     printf("[LR-TT CUDA] populateFrom complete: PWUs: A=%s, B=%s\n",
