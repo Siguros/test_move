@@ -32,7 +32,8 @@ from aihwkit.simulator.configs import (
     FloatingPointRPUConfig,
     LRTTTransferCompound, 
     ConstantStepDevice, 
-    FloatingPointDevice
+    FloatingPointDevice,
+    UnitCellRPUConfig
 )
 from aihwkit.simulator.rpu_base import cuda
 
@@ -59,7 +60,7 @@ MONITOR_LRTT = True  # Enable LRTT operation monitoring
 # LR-TT parameters
 LRTT_RANK = 8  # Low-rank dimension
 TRANSFER_EVERY = 2  # Transfer every N updates
-TRANSFER_LR = 0.00000001  # Transfer learning rate (Note: actual transfer is limited by device dw_min)
+TRANSFER_LR = 10000  # Transfer learning rate (Note: actual transfer is limited by device dw_min)
 
 
 def get_lrtt_weights(layer):
@@ -110,7 +111,7 @@ def create_lrtt_config():
         transfer_use_bl_management=False,
         transfer_use_update_management=False
     )
-    return SingleRPUConfig(device=lrtt_config)
+    return  UnitCellRPUConfig(device=lrtt_config)
 
 
 def create_analog_network_lrtt(input_size, hidden_sizes, output_size):

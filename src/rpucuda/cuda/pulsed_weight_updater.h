@@ -63,6 +63,14 @@ public:
       const bool d_trans,
       const T beta = (T)1.0);
   void setVerbosityLevel(int level) { verbose_ = level; };
+  
+  // Enable/disable raw input exposure in BitLineMaker (needed for LR-TT projection)
+  void setExposeRawInputs(bool enable) {
+    if (blm_) {
+      blm_->setExposeRawInputs(enable);
+    }
+  }
+  
   void dumpExtra(RPU::state_t &extra, const std::string prefix);
   void loadExtra(const RPU::state_t &extra, const std::string prefix, bool strict);
 

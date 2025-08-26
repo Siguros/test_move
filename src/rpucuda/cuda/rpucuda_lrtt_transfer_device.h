@@ -218,6 +218,14 @@ protected:
   void initializeDevicePointers();
   void ensureLazyInit();
   
+  // Override parent's transfer to use AB outer product
+  void transfer(
+      int to_device_idx,
+      int from_device_idx,
+      const PulsedUpdateMetaParameter<T> &current_up,
+      const T current_lr,
+      const T current_count_lr) override;
+  
   // Transfer helpers
   void applyABOuterAsPulsedUpdate(T lr_scale, cudaStream_t stream);
   // Digital transfer removed - only pulsed stochastic updates are used
