@@ -651,9 +651,9 @@ LRTTTransferRPUDeviceCuda<T>::LRTTTransferRPUDeviceCuda(
     // Check if fastB device supports pulsed updates
     if (idx_fastB_ < this->rpucuda_device_vec_.size() && 
         this->rpucuda_device_vec_[idx_fastB_]) {
-      auto* devB = dynamic_cast<PulsedRPUDeviceCudaBase<T>*>(
+      auto* devB_pulsed = dynamic_cast<PulsedRPUDeviceCudaBase<T>*>(
           this->rpucuda_device_vec_[idx_fastB_].get());
-      if (devB) {
+      if (devB_pulsed) {
         // Create PWU for fastB (always use full tile dimensions)
         fastB_pwu_ = std::make_unique<PulsedWeightUpdater<T>>(c, x_size, d_size);
         fastB_pwu_->setExposeRawInputs(true);  // Enable raw inputs for LR-TT projection
@@ -1044,9 +1044,9 @@ void LRTTTransferRPUDeviceCuda<T>::populateFrom(const AbstractRPUDevice<T> &rpu_
     
     if (!fastB_pwu_ && idx_fastB_ < this->rpucuda_device_vec_.size() && 
         this->rpucuda_device_vec_[idx_fastB_]) {
-      auto* devB = dynamic_cast<PulsedRPUDeviceCudaBase<T>*>(
+      auto* devB_pulsed = dynamic_cast<PulsedRPUDeviceCudaBase<T>*>(
           this->rpucuda_device_vec_[idx_fastB_].get());
-      if (devB) {
+      if (devB_pulsed) {
         fastB_pwu_ = std::make_unique<PulsedWeightUpdater<T>>(this->context_, this->x_size_, this->d_size_);
         fastB_pwu_->setExposeRawInputs(true);  // Enable raw inputs for LR-TT projection
         if (getenv("AIHWKIT_DEBUG_LRTT")) {
@@ -1607,9 +1607,6 @@ void LRTTTransferRPUDeviceCuda<T>::reinitFastTiles(cudaStream_t stream) {
       if (getenv("AIHWKIT_DEBUG_LRTT")) {
         printf("[LR-TT] reinitFastTiles: Cannot initialize - weight pointers still NULL\n");
       }
-      if (switched) {
-        this->context_->releaseExternalStream();
-      }
       return;
     }
   }
@@ -1642,9 +1639,9 @@ void LRTTTransferRPUDeviceCuda<T>::reinitFastTiles(cudaStream_t stream) {
       dev_w_b_, d, x, K, seed, std_dev_B);
   
   // Kaiming 초기값은 곧바로 FP 경로(투영/패킹)에 사용되므로 디바이스 bound로 클립
-  if (auto *devB = dynamic_cast<PulsedRPUDeviceCudaBase<T>*>(
+  if (auto *devB_pulsed = dynamic_cast<PulsedRPUDeviceCudaBase<T>*>(
           this->rpucuda_device_vec_[idx_fastB_].get())) {
-    devB->clipWeights(dev_w_b_, (T)-1.0); // device default bounds
+    devB_pulsed->clipWeights(dev_w_b_, (T)-1.0); // device default bounds
   }
 }
 
@@ -1906,11 +1903,6 @@ void LRTTTransferRPUDeviceCuda<T>::doLoRAUpdate(
     this->context_->synchronize();
     printf("[LR-TT LoRA] After update: ||A[:,:K]||_F = %.6e, ||B[:K,:]||_F = %.6e\n", 
            (float)norm_a, (float)norm_b);
-  }
-  
-  // Restore the original stream if we switched it
-  if (switched) {
-    this->context_->releaseExternalStream();
   }
 }
 
