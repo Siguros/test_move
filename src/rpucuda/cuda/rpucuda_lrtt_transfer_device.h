@@ -347,6 +347,11 @@ private:
   // Event for cross-stream synchronization of visible weight copies
   cudaEvent_t visible_sync_ev_ = nullptr;
   
+  // Critical fix: Initialize need_reinit_ and add A/B reinit synchronization
+  bool need_reinit_ = false;           // Must be explicitly initialized
+  cudaEvent_t ab_reinit_ev_ = nullptr; // A/B reinit completion signal
+  bool ab_initialized_ = false;        // Whether A/B are valid
+  
 public:
   // Helper to wait for visible sync completion on a consumer stream
   inline void waitVisibleSyncOn(cudaStream_t consumer) {
@@ -355,6 +360,16 @@ public:
         printf("[DEBUG] waiting on visible-sync event from stream %p\n", consumer);
       }
       CUDA_CALL(cudaStreamWaitEvent(consumer, visible_sync_ev_, 0));
+    }
+  }
+  
+  // Helper to wait for A/B reinit completion on a consumer stream
+  inline void waitABReinitOn(cudaStream_t s) {
+    if (ab_initialized_ && ab_reinit_ev_) { 
+      if (std::getenv("AIHWKIT_DEBUG_LRTT")) {
+        printf("[DEBUG] waiting on A/B reinit event from stream %p\n", s);
+      }
+      CUDA_CALL(cudaStreamWaitEvent(s, ab_reinit_ev_, 0)); 
     }
   }
 };

@@ -97,7 +97,7 @@ void LRTTTransferRPUDeviceMetaParameter<T>::printToStream(std::stringstream &ss)
      << ", fastB=" << idx_fastB << std::endl;
   ss << "\t Rank: " << rank << std::endl;
   ss << "\t Update rule: LR_TT" << std::endl;
-  ss << "\t Transfer LR: " << transfer_lr << std::endl;
+  ss << "\t Transfer LR: " << this->transfer_lr << std::endl;
   ss << "\t LoRA alpha: " << lora_alpha << std::endl;
   ss << "\t Forward inject: " << forward_inject << std::endl;
   ss << "\t Correct gradient magnitudes: " << correct_gradient_magnitudes << std::endl;

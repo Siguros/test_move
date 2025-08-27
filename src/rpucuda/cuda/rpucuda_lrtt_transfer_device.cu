@@ -674,6 +674,10 @@ LRTTTransferRPUDeviceCuda<T>::LRTTTransferRPUDeviceCuda(
   }
   
   c->synchronize();
+  
+  // Critical fix: Initialize need_reinit_ based on rank
+  need_reinit_ = (rank_ > 0);
+  ab_initialized_ = false;
 }
 
 // Destructor
@@ -682,6 +686,10 @@ LRTTTransferRPUDeviceCuda<T>::~LRTTTransferRPUDeviceCuda() {
   if (visible_sync_ev_) {
     cudaEventDestroy(visible_sync_ev_);
     visible_sync_ev_ = nullptr;
+  }
+  if (ab_reinit_ev_) {
+    cudaEventDestroy(ab_reinit_ev_);
+    ab_reinit_ev_ = nullptr;
   }
 }
 
@@ -761,6 +769,10 @@ LRTTTransferRPUDeviceCuda<T>::LRTTTransferRPUDeviceCuda(
   
   // Re-initialize device pointers after copy
   initializeDevicePointers();
+  
+  // Critical fix: Initialize need_reinit_ based on rank
+  need_reinit_ = (rank_ > 0);
+  ab_initialized_ = false;
 }
 
 template <typename T>
@@ -838,6 +850,10 @@ LRTTTransferRPUDeviceCuda<T>::operator=(const LRTTTransferRPUDeviceCuda<T> &othe
     }
     
     initializeDevicePointers();
+    
+    // Critical fix: Initialize need_reinit_ based on rank
+    need_reinit_ = (rank_ > 0);
+    ab_initialized_ = false;
   }
   return *this;
 }
@@ -899,6 +915,10 @@ LRTTTransferRPUDeviceCuda<T>::LRTTTransferRPUDeviceCuda(
   other.dev_w_b_ = nullptr;
   other.scratch_mb_capacity_ = 0;
   other.visible_sync_ev_ = nullptr;  // Clear moved-from event
+  
+  // Critical fix: Initialize need_reinit_ based on rank
+  need_reinit_ = (rank_ > 0);
+  ab_initialized_ = false;
 }
 
 template <typename T>
@@ -963,6 +983,10 @@ LRTTTransferRPUDeviceCuda<T>::operator=(LRTTTransferRPUDeviceCuda<T> &&other) no
     other.dev_w_b_ = nullptr;
     other.scratch_mb_capacity_ = 0;
     other.visible_sync_ev_ = nullptr;  // Clear moved-from event
+    
+    // Critical fix: Initialize need_reinit_ based on rank
+    need_reinit_ = (rank_ > 0);
+    ab_initialized_ = false;
   }
   return *this;
 }
@@ -1097,18 +1121,14 @@ void LRTTTransferRPUDeviceCuda<T>::populateFrom(const AbstractRPUDevice<T> &rpu_
     initializeDevicePointers();
     
     // Perform initial reinit if pointers are ready
-    if (dev_w_a_ && dev_w_b_) {
-      reinitFastTiles(this->context_->getStream());
-      if (getenv("AIHWKIT_DEBUG_LRTT")) {
-        printf("[LR-TT CUDA] Initial reinit complete in populateFrom: A=0, B~Kaiming\n");
-      }
-      // CRITICAL FIX: Also schedule reinit on first update stream to avoid cross-stream race
-      // This ensures the first update step will reinit on its own stream, making it safe
-      need_reinit_ = true;
-    } else {
-      // Fallback: schedule lazy init if pointers not ready yet
-      need_reinit_ = true;
-      if (getenv("AIHWKIT_DEBUG_LRTT")) {
+    // CRITICAL FIX: Don't reinit immediately in populateFrom
+    // This avoids race condition with runUpdateKernel's reinit at transfer_counter_=0
+    // Instead, just mark that reinit is needed
+    need_reinit_ = true;
+    if (getenv("AIHWKIT_DEBUG_LRTT")) {
+      if (dev_w_a_ && dev_w_b_) {
+        printf("[LR-TT CUDA] Pointers ready in populateFrom, reinit scheduled for first update\n");
+      } else {
         printf("[LR-TT CUDA] Pointers not ready, lazy reinit scheduled\n");
       }
     }
@@ -1147,8 +1167,7 @@ inline void LRTTTransferRPUDeviceCuda<T>::checkWeightsReadyOrDie() {
   if (!dev_w_visible_ || !dev_w_a_ || !dev_w_b_) {
     initializeDevicePointers();
     if (!dev_w_visible_ || !dev_w_a_ || !dev_w_b_) {
-      RPU_FATAL("LRTT: device weight pointers not initialized (visible=%p, A=%p, B=%p) before use.",
-                dev_w_visible_, dev_w_a_, dev_w_b_);
+      RPU_FATAL("LRTT: device weight pointers not initialized before use.");
     }
   }
 }
@@ -1218,9 +1237,6 @@ void LRTTTransferRPUDeviceCuda<T>::runUpdateKernel(
   
   // Get the stream that will be used for updates
   cudaStream_t update_stream = up_context ? up_context->getStream() : this->context_->getStream();
-  
-  // CRITICAL FIX: Ensure lazy initialization is complete on the same stream as updates
-  ensureLazyInit(update_stream);
   
   // Validate preconditions for LR-TT operation
   if (update_rule_ != LRUpdateRule::LR_TT) {
@@ -1300,12 +1316,18 @@ void LRTTTransferRPUDeviceCuda<T>::runUpdateKernel(
     const int transfer_every = transfer_every_;
     if (transfer_every > 0 && transfer_counter_ == 0) {
       // Beginning of new cycle: reinit A,B BEFORE accumulating gradients
+      // IMPORTANT: Clear need_reinit_ flag to prevent duplicate reinit from ensureLazyInit
+      need_reinit_ = false;
+      
       cudaStream_t transfer_stream = up_context ? up_context->getStream() : this->context_->getStream();
       reinitFastTiles(transfer_stream);
       if (getenv("AIHWKIT_DEBUG_LRTT")) {
         printf("[LR-TT Pulsed] New cycle started: reinit A,B BEFORE update (transfer_every=%d %s)\n", 
                transfer_every, units_in_mbatch_ ? "samples" : "batches");
       }
+    } else {
+      // Not at cycle boundary: ensure lazy init if needed
+      ensureLazyInit(update_stream);
     }
     
     // Apply gradient magnitude correction if enabled (for pulsed path)
@@ -1412,6 +1434,10 @@ void LRTTTransferRPUDeviceCuda<T>::applyABOuterAsPulsedUpdate(T lr_scale, cudaSt
   ensureABScratch_(); // Ensure dev_temp_d_ and dev_temp_x_ are allocated
 
   cudaStream_t s = stream ? stream : this->context_->getStream();
+  
+  // Critical fix: Wait for A/B reinit completion before reading
+  waitABReinitOn(s);
+  
   cudaStream_t ctx_s = this->context_->getStream();
   const bool cross_stream = (ctx_s != s);
   
@@ -1659,10 +1685,32 @@ void LRTTTransferRPUDeviceCuda<T>::reinitFastTiles(cudaStream_t stream) {
   kernelKaimingInitFirstKRowsStateless<<<blocks_B_lr, threads, 0, s>>>(
       dev_w_b_, d, x, K, seed, std_dev_B);
   
+  // Critical fix: Ensure clipWeights runs on the same stream to avoid race condition
   // Kaiming 초기값은 곧바로 FP 경로(투영/패킹)에 사용되므로 디바이스 bound로 클립
+  bool switched = false;
+  if (s != this->context_->getStream()) {
+    this->context_->setExternalStream(s);
+    switched = true;
+  }
+  
   if (auto *devB_pulsed = dynamic_cast<PulsedRPUDeviceCudaBase<T>*>(
           this->rpucuda_device_vec_[idx_fastB_].get())) {
     devB_pulsed->clipWeights(dev_w_b_, (T)-1.0); // device default bounds
+  }
+  
+  if (switched) {
+    this->context_->releaseExternalStream();
+  }
+  
+  // Critical fix: Record A/B reinit completion event for synchronization
+  if (!ab_reinit_ev_) {
+    CUDA_CALL(cudaEventCreateWithFlags(&ab_reinit_ev_, cudaEventDisableTiming));
+  }
+  CUDA_CALL(cudaEventRecord(ab_reinit_ev_, s));
+  ab_initialized_ = true;
+  
+  if (getenv("AIHWKIT_DEBUG_LRTT")) {
+    printf("[LR-TT] reinitFastTiles complete: A=0, B~Kaiming, event recorded on stream %p\n", s);
   }
 }
 
@@ -1817,10 +1865,7 @@ void LRTTTransferRPUDeviceCuda<T>::doLoRAUpdate(
   
   // CRITICAL: Verify all pointers are valid before GEMM operations
   if (!dev_w_a_ || !dev_w_b_ || !dev_temp_d_ || !dev_temp_x_ || !dev_xa_mb_ || !dev_db_mb_) {
-    RPU_FATAL("LR-TT: NULL pointers detected before LoRA update. A=%p, B=%p, temp_d=%p, temp_x=%p",
-              dev_w_a_, dev_w_b_, 
-              dev_temp_d_ ? dev_temp_d_->getData() : nullptr,
-              dev_temp_x_ ? dev_temp_x_->getData() : nullptr);
+    RPU_FATAL("LR-TT: NULL pointers detected before LoRA update.");
   }
   
   // 1. Pack A_lr and B_lr submatrices
@@ -1977,6 +2022,9 @@ void LRTTTransferRPUDeviceCuda<T>::doLoRAPulsedUpdate_(
   } // else keep device default
 
   cudaStream_t s = up_context ? up_context->getStream() : this->context_->getStream();
+  
+  // Critical fix: Wait for A/B reinit completion before reading
+  waitABReinitOn(s);
   
   // Ensure all math/PWU operations use the same stream as pack/route kernels
   // This prevents cross-stream races when up_context stream differs from this->context_ stream
@@ -2236,6 +2284,9 @@ void LRTTTransferRPUDeviceCuda<T>::composeForwardInject(
   // Wait for any pending visible sync from another stream
   waitVisibleSyncOn(s);
   
+  // Critical fix: Wait for A/B reinit completion before reading
+  waitABReinitOn(s);
+  
   // Fix A: Ensure visible weights are synced on first forward
   if (!visible_synced_ && last_agg_ptr_) {
     syncVisibleWithAggregated(last_agg_ptr_, s);
@@ -2311,6 +2362,9 @@ bool LRTTTransferRPUDeviceCuda<T>::forwardWithAnalogInject(
 
   // CRITICAL FIX: Ensure lazy initialization is complete on the context stream (for forward)
   ensureLazyInit(this->context_->getStream());
+  
+  // Critical fix: Wait for A/B reinit completion before reading
+  waitABReinitOn(this->context_->getStream());
 
   // Fallback: if not enabled or invalid rank, use existing visible-only path
   if (!forward_inject_ || rank_ <= 0) {
@@ -2479,6 +2533,9 @@ void LRTTTransferRPUDeviceCuda<T>::copyALRTo(T* dst, cudaStream_t stream) const 
   const int r = rank_;
   cudaStream_t s = stream ? stream : this->context_->getStream();
   
+  // Critical fix: Wait for A/B reinit completion before reading
+  const_cast<LRTTTransferRPUDeviceCuda<T>*>(this)->waitABReinitOn(s);
+  
   // Extract first r columns from dev_w_a_ (which is [d, x_size])
   // We need to pack the first r columns into a compact [d, r] matrix
   const int threads = 256;
@@ -2495,6 +2552,9 @@ void LRTTTransferRPUDeviceCuda<T>::copyBLRTo(T* dst, cudaStream_t stream) const 
   const int x = this->x_size_;
   cudaStream_t s = stream ? stream : this->context_->getStream();
   
+  // Critical fix: Wait for A/B reinit completion before reading
+  const_cast<LRTTTransferRPUDeviceCuda<T>*>(this)->waitABReinitOn(s);
+  
   // Extract first r rows from dev_w_b_ (which is [d_size, x])
   // We need to pack the first r rows into a compact [r, x] matrix
   const int threads = 256;
@@ -2510,6 +2570,10 @@ void LRTTTransferRPUDeviceCuda<T>::copyVisibleWeightsFrom(const T* src, cudaStre
   const int d = this->d_size_;
   const int x = this->x_size_;
   cudaStream_t s = stream ? stream : this->context_->getStream();
+  
+  // Critical fix: Wait for visible sync completion before writing
+  waitVisibleSyncOn(s);
+  
   RPU::math::copy<T>(this->context_, d * x, src, 1, dev_w_visible_, 1);
 }
 
@@ -2522,6 +2586,9 @@ void LRTTTransferRPUDeviceCuda<T>::copyALRFrom(const T* src, cudaStream_t stream
   const int r = rank_;
   const int x = this->x_size_;
   cudaStream_t s = stream ? stream : this->context_->getStream();
+  
+  // Critical fix: Wait for A/B reinit completion before writing
+  waitABReinitOn(s);
   
   // Zero the full matrix first
   const int threads = 256;
@@ -2542,6 +2609,9 @@ void LRTTTransferRPUDeviceCuda<T>::copyBLRFrom(const T* src, cudaStream_t stream
   const int r = rank_;
   const int x = this->x_size_;
   cudaStream_t s = stream ? stream : this->context_->getStream();
+  
+  // Critical fix: Wait for A/B reinit completion before writing
+  waitABReinitOn(s);
   
   // Zero the full matrix first
   const int threads = 256;
