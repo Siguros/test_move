@@ -96,6 +96,9 @@ public:
     swap(a.visible_synced_, b.visible_synced_);
     swap(a.last_agg_ptr_, b.last_agg_ptr_);
     swap(a.visible_sync_ev_, b.visible_sync_ev_);
+    swap(a.ab_reinit_ev_, b.ab_reinit_ev_);
+    swap(a.ab_initialized_, b.ab_initialized_);
+    swap(a.need_reinit_, b.need_reinit_);
     swap(a.rank_chunk_, b.rank_chunk_);
     swap(a.correct_gradient_magnitudes_, b.correct_gradient_magnitudes_);
     swap(a.forward_inject_, b.forward_inject_);
@@ -296,7 +299,7 @@ private:
   LRUpdateRule update_rule_ = LRUpdateRule::LR_TT;  // Fixed to LR_TT
   
   // Lazy initialization flag for reinit
-  bool need_reinit_ = true;  // Set to true to trigger reinit on first use
+  bool need_reinit_ = true;  // Start with reinit needed, will be cleared after first reinit
   
   // Device weight pointers (no ownership, just references)
   T *dev_w_visible_ = nullptr;
@@ -347,8 +350,7 @@ private:
   // Event for cross-stream synchronization of visible weight copies
   cudaEvent_t visible_sync_ev_ = nullptr;
   
-  // Critical fix: Initialize need_reinit_ and add A/B reinit synchronization
-  bool need_reinit_ = false;           // Must be explicitly initialized
+  // Critical fix: Add A/B reinit synchronization
   cudaEvent_t ab_reinit_ev_ = nullptr; // A/B reinit completion signal
   bool ab_initialized_ = false;        // Whether A/B are valid
   

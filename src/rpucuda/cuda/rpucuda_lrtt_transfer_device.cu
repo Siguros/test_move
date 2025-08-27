@@ -675,7 +675,11 @@ LRTTTransferRPUDeviceCuda<T>::LRTTTransferRPUDeviceCuda(
   
   c->synchronize();
   
-  // Critical fix: Initialize need_reinit_ based on rank
+  // Create CUDA events for synchronization
+  CUDA_CALL(cudaEventCreateWithFlags(&visible_sync_ev_, cudaEventDisableTiming));
+  CUDA_CALL(cudaEventCreateWithFlags(&ab_reinit_ev_, cudaEventDisableTiming));
+  
+  // Initialize reinit state
   need_reinit_ = (rank_ > 0);
   ab_initialized_ = false;
 }
@@ -770,7 +774,11 @@ LRTTTransferRPUDeviceCuda<T>::LRTTTransferRPUDeviceCuda(
   // Re-initialize device pointers after copy
   initializeDevicePointers();
   
-  // Critical fix: Initialize need_reinit_ based on rank
+  // Create CUDA events for synchronization
+  CUDA_CALL(cudaEventCreateWithFlags(&visible_sync_ev_, cudaEventDisableTiming));
+  CUDA_CALL(cudaEventCreateWithFlags(&ab_reinit_ev_, cudaEventDisableTiming));
+  
+  // Initialize reinit state
   need_reinit_ = (rank_ > 0);
   ab_initialized_ = false;
 }
@@ -806,11 +814,15 @@ LRTTTransferRPUDeviceCuda<T>::operator=(const LRTTTransferRPUDeviceCuda<T> &othe
     debug_no_host_copies_ = 0;
     reinit_counter_ = 0;  // Reset counter
     
-    // Destroy existing event if any
+    // Destroy existing events if any
     if (visible_sync_ev_) {
       cudaEventDestroy(visible_sync_ev_);
+      visible_sync_ev_ = nullptr;
     }
-    visible_sync_ev_ = nullptr;  // Never copy event handles
+    if (ab_reinit_ev_) {
+      cudaEventDestroy(ab_reinit_ev_);
+      ab_reinit_ev_ = nullptr;
+    }
     visible_synced_ = false;     // Force re-sync on first use
     last_agg_ptr_ = nullptr;
     
@@ -851,7 +863,11 @@ LRTTTransferRPUDeviceCuda<T>::operator=(const LRTTTransferRPUDeviceCuda<T> &othe
     
     initializeDevicePointers();
     
-    // Critical fix: Initialize need_reinit_ based on rank
+    // Create CUDA events for synchronization (copy constructor deep copy)
+    CUDA_CALL(cudaEventCreateWithFlags(&visible_sync_ev_, cudaEventDisableTiming));
+    CUDA_CALL(cudaEventCreateWithFlags(&ab_reinit_ev_, cudaEventDisableTiming));
+    
+    // Initialize reinit state
     need_reinit_ = (rank_ > 0);
     ab_initialized_ = false;
   }
@@ -908,17 +924,19 @@ LRTTTransferRPUDeviceCuda<T>::LRTTTransferRPUDeviceCuda(
       dev_temp_x_T_(std::move(other.dev_temp_x_T_)),
       visible_synced_(other.visible_synced_),
       last_agg_ptr_(other.last_agg_ptr_),
-      visible_sync_ev_(other.visible_sync_ev_) {  // Transfer event handle
+      visible_sync_ev_(other.visible_sync_ev_),  // Transfer event handle
+      ab_reinit_ev_(other.ab_reinit_ev_),        // Transfer event handle
+      ab_initialized_(other.ab_initialized_),
+      need_reinit_(other.need_reinit_) {
   
   other.dev_w_visible_ = nullptr;
   other.dev_w_a_ = nullptr;
   other.dev_w_b_ = nullptr;
   other.scratch_mb_capacity_ = 0;
   other.visible_sync_ev_ = nullptr;  // Clear moved-from event
-  
-  // Critical fix: Initialize need_reinit_ based on rank
-  need_reinit_ = (rank_ > 0);
-  ab_initialized_ = false;
+  other.ab_reinit_ev_ = nullptr;     // Clear moved-from event
+  other.ab_initialized_ = false;
+  other.need_reinit_ = false;
 }
 
 template <typename T>
@@ -970,23 +988,28 @@ LRTTTransferRPUDeviceCuda<T>::operator=(LRTTTransferRPUDeviceCuda<T> &&other) no
     dev_temp_x_T_ = std::move(other.dev_temp_x_T_);
     reinit_counter_ = other.reinit_counter_;
     
-    // Destroy existing event if any, then transfer the handle
+    // Destroy existing events if any, then transfer the handles
     if (visible_sync_ev_) {
       cudaEventDestroy(visible_sync_ev_);
+    }
+    if (ab_reinit_ev_) {
+      cudaEventDestroy(ab_reinit_ev_);
     }
     visible_sync_ev_ = other.visible_sync_ev_;
     visible_synced_ = other.visible_synced_;
     last_agg_ptr_ = other.last_agg_ptr_;
+    ab_reinit_ev_ = other.ab_reinit_ev_;
+    ab_initialized_ = other.ab_initialized_;
+    need_reinit_ = other.need_reinit_;
     
     other.dev_w_visible_ = nullptr;
     other.dev_w_a_ = nullptr;
     other.dev_w_b_ = nullptr;
     other.scratch_mb_capacity_ = 0;
     other.visible_sync_ev_ = nullptr;  // Clear moved-from event
-    
-    // Critical fix: Initialize need_reinit_ based on rank
-    need_reinit_ = (rank_ > 0);
-    ab_initialized_ = false;
+    other.ab_reinit_ev_ = nullptr;     // Clear moved-from event
+    other.ab_initialized_ = false;
+    other.need_reinit_ = false;
   }
   return *this;
 }
@@ -1621,14 +1644,23 @@ void LRTTTransferRPUDeviceCuda<T>::reinitFastTiles(cudaStream_t stream) {
   const int K = rank_;
   if (K <= 0) return;
 
+  const int d = this->d_size_;
+  const int x = this->x_size_;
+  
+  // CRITICAL: Bounds check to avoid OOB writes
+  if (K > d || K > x) {
+    std::ostringstream ss;
+    ss << "LRTT reinitFastTiles: rank K=" << K
+       << " exceeds matrix dims (d=" << d << ", x=" << x << ").";
+    RPU_FATAL(ss.str().c_str());
+  }
+
   cudaStream_t s = stream ? stream : this->context_->getStream();
   
   // Use the provided stream directly without switching context
   // This avoids dangerous global state modifications
   
   const int threads = 256;
-  const int d = this->d_size_;
-  const int x = this->x_size_;
 
   if (getenv("AIHWKIT_DEBUG_LRTT")) {
     printf("[LR-TT] reinitFastTiles (LoRA-convention mapping): K=%d\n", K);
@@ -1685,27 +1717,20 @@ void LRTTTransferRPUDeviceCuda<T>::reinitFastTiles(cudaStream_t stream) {
   kernelKaimingInitFirstKRowsStateless<<<blocks_B_lr, threads, 0, s>>>(
       dev_w_b_, d, x, K, seed, std_dev_B);
   
-  // Critical fix: Ensure clipWeights runs on the same stream to avoid race condition
-  // Kaiming 초기값은 곧바로 FP 경로(투영/패킹)에 사용되므로 디바이스 bound로 클립
-  bool switched = false;
-  if (s != this->context_->getStream()) {
-    this->context_->setExternalStream(s);
-    switched = true;
-  }
+  // IMPORTANT: Skip clipping after Kaiming initialization
+  // The Kaiming distribution is already designed to have reasonable bounds,
+  // and clipWeights with -1.0 parameter can cause B_lr to become zero
+  // depending on device implementation. PWU will apply proper clipping
+  // during updates if needed.
   
-  if (auto *devB_pulsed = dynamic_cast<PulsedRPUDeviceCudaBase<T>*>(
-          this->rpucuda_device_vec_[idx_fastB_].get())) {
-    devB_pulsed->clipWeights(dev_w_b_, (T)-1.0); // device default bounds
-  }
-  
-  if (switched) {
-    this->context_->releaseExternalStream();
-  }
+  // Commented out to prevent B_lr becoming zero:
+  // if (auto *devB_pulsed = dynamic_cast<PulsedRPUDeviceCudaBase<T>*>(
+  //         this->rpucuda_device_vec_[idx_fastB_].get())) {
+  //   devB_pulsed->clipWeights(dev_w_b_, (T)-1.0);
+  // }
   
   // Critical fix: Record A/B reinit completion event for synchronization
-  if (!ab_reinit_ev_) {
-    CUDA_CALL(cudaEventCreateWithFlags(&ab_reinit_ev_, cudaEventDisableTiming));
-  }
+  // Event is already created in constructor, just record it
   CUDA_CALL(cudaEventRecord(ab_reinit_ev_, s));
   ab_initialized_ = true;
   
@@ -1995,6 +2020,17 @@ void LRTTTransferRPUDeviceCuda<T>::doLoRAUpdate(
   }
 }
 
+// Helper function to safely compute nrm2 with device pointer mode
+template <typename T>
+static inline T nrm2_to_host(CudaContextPtr ctx, int N, const T* X, int incX = 1) {
+  CudaArray<T> dres(ctx, 1);
+  dres.setConst((T)0);
+  RPU::math::nrm2<T>(ctx, N, X, incX, dres.getData()); // device pointer!
+  T hres = (T)0;
+  dres.copyTo(&hres);  // D2H
+  return hres;
+}
+
 // Step-2: Pulsed LoRA update implementation (always enabled, no more compile guards)
 template <typename T>
 void LRTTTransferRPUDeviceCuda<T>::doLoRAPulsedUpdate_(
@@ -2050,8 +2086,7 @@ void LRTTTransferRPUDeviceCuda<T>::doLoRAPulsedUpdate_(
   if (getenv("AIHWKIT_DEBUG_LRTT")) {
     // Check B_lr before projection (with safety check)
     if (dev_temp_x_ && dev_temp_x_->getData() && K > 0 && this->x_size_ > 0) {
-      T b_lr_norm = 0;
-      RPU::math::nrm2<T>(this->context_, K * this->x_size_, dev_temp_x_->getData(), 1, &b_lr_norm);
+      T b_lr_norm = nrm2_to_host(this->context_, K * this->x_size_, dev_temp_x_->getData(), 1);
       printf("  B_lr (for projection) norm: %.8e\n", (float)b_lr_norm);
     }
   }
@@ -2068,9 +2103,8 @@ void LRTTTransferRPUDeviceCuda<T>::doLoRAPulsedUpdate_(
   
   if (getenv("AIHWKIT_DEBUG_LRTT")) {
     // Check projections after computation
-    T xb_norm = 0, da_norm = 0;
-    RPU::math::nrm2<T>(this->context_, K * m_batch, dev_xb_mb_->getData(), 1, &xb_norm);
-    RPU::math::nrm2<T>(this->context_, K * m_batch, dev_da_mb_->getData(), 1, &da_norm);
+    T xb_norm = nrm2_to_host(this->context_, K * m_batch, dev_xb_mb_->getData(), 1);
+    T da_norm = nrm2_to_host(this->context_, K * m_batch, dev_da_mb_->getData(), 1);
     printf("  X_B projection norm: %.8e, D_A projection norm: %.8e\n", (float)xb_norm, (float)da_norm);
   }
 
@@ -2112,18 +2146,15 @@ void LRTTTransferRPUDeviceCuda<T>::doLoRAPulsedUpdate_(
       printf("[LR-TT DEBUG] Updating A device (idx=%d), lr=%.6e\n", idx_fastA_, (float)lr);
       
       // Check A weights before update
-      T w_a_before_norm = 0;
-      RPU::math::nrm2<T>(this->context_, this->size_, dev_w_a_, 1, &w_a_before_norm);
+      T w_a_before_norm = nrm2_to_host(this->context_, this->size_, dev_w_a_, 1);
       printf("  A weights before update: norm=%.8e\n", (float)w_a_before_norm);
       
       // Check X_B (padded input)
-      T x_pad_norm = 0;
-      RPU::math::nrm2<T>(this->context_, this->d_size_ * m_batch, dev_x_pad_->getData(), 1, &x_pad_norm);
+      T x_pad_norm = nrm2_to_host(this->context_, this->d_size_ * m_batch, dev_x_pad_->getData(), 1);
       printf("  X_B (padded) norm: %.8e\n", (float)x_pad_norm);
       
       // Check D (original gradient)
-      T d_norm = 0;
-      RPU::math::nrm2<T>(this->context_, this->d_size_ * m_batch, d_in, 1, &d_norm);
+      T d_norm = nrm2_to_host(this->context_, this->d_size_ * m_batch, d_in, 1);
       printf("  D (gradient) norm: %.8e\n", (float)d_norm);
     }
     num_a_updates_++;
@@ -2134,8 +2165,7 @@ void LRTTTransferRPUDeviceCuda<T>::doLoRAPulsedUpdate_(
     
     if (getenv("AIHWKIT_DEBUG_LRTT")) {
       // Check A weights after update
-      T w_a_after_norm = 0;
-      RPU::math::nrm2<T>(this->context_, this->size_, dev_w_a_, 1, &w_a_after_norm);
+      T w_a_after_norm = nrm2_to_host(this->context_, this->size_, dev_w_a_, 1);
       printf("  A weights after update: norm=%.8e\n", (float)w_a_after_norm);
     }
   }
@@ -2144,18 +2174,15 @@ void LRTTTransferRPUDeviceCuda<T>::doLoRAPulsedUpdate_(
       printf("[LR-TT DEBUG] Updating B device (idx=%d), lr=%.6e\n", idx_fastB_, (float)lr);
       
       // Check B weights before update
-      T w_b_before_norm = 0;
-      RPU::math::nrm2<T>(this->context_, this->size_, dev_w_b_, 1, &w_b_before_norm);
+      T w_b_before_norm = nrm2_to_host(this->context_, this->size_, dev_w_b_, 1);
       printf("  B weights before update: norm=%.8e\n", (float)w_b_before_norm);
       
       // Check X (original input)
-      T x_norm = 0;
-      RPU::math::nrm2<T>(this->context_, this->x_size_ * m_batch, x_in, 1, &x_norm);
+      T x_norm = nrm2_to_host(this->context_, this->x_size_ * m_batch, x_in, 1);
       printf("  X (input) norm: %.8e\n", (float)x_norm);
       
       // Check D_A (padded gradient)
-      T d_pad_norm = 0;
-      RPU::math::nrm2<T>(this->context_, this->d_size_ * m_batch, dev_d_pad_->getData(), 1, &d_pad_norm);
+      T d_pad_norm = nrm2_to_host(this->context_, this->d_size_ * m_batch, dev_d_pad_->getData(), 1);
       printf("  D_A (padded) norm: %.8e\n", (float)d_pad_norm);
     }
     num_b_updates_++;
@@ -2166,8 +2193,7 @@ void LRTTTransferRPUDeviceCuda<T>::doLoRAPulsedUpdate_(
     
     if (getenv("AIHWKIT_DEBUG_LRTT")) {
       // Check B weights after update  
-      T w_b_after_norm = 0;
-      RPU::math::nrm2<T>(this->context_, this->size_, dev_w_b_, 1, &w_b_after_norm);
+      T w_b_after_norm = nrm2_to_host(this->context_, this->size_, dev_w_b_, 1);
       printf("  B weights after update: norm=%.8e\n", (float)w_b_after_norm);
     }
   }
@@ -2278,8 +2304,8 @@ void LRTTTransferRPUDeviceCuda<T>::composeForwardInject(
     }
   }
 
-  // Force single stream to avoid races between pack kernels and GEMM
-  cudaStream_t s = this->context_->getStream();
+  // Use provided stream if available, otherwise use context stream
+  cudaStream_t s = stream ? stream : this->context_->getStream();
   
   // Wait for any pending visible sync from another stream
   waitVisibleSyncOn(s);
@@ -2328,6 +2354,14 @@ void LRTTTransferRPUDeviceCuda<T>::composeForwardInject(
 
   // 3) dev_out += alpha * (A_lr @ B_lr)
   // All matrices are column-major [d, x] as in the rest of the codebase.
+  
+  // CRITICAL: Ensure GEMM runs on the same stream as pack kernels to avoid race condition
+  bool switched = false;
+  if (s != this->context_->getStream()) {
+    this->context_->setExternalStream(s);
+    switched = true;
+  }
+  
   RPU::math::gemm<T>(
       this->context_,
       /*trans_A=*/false, /*trans_B=*/false, // [d,K] @ [K,x] -> [d,x]
@@ -2337,6 +2371,10 @@ void LRTTTransferRPUDeviceCuda<T>::composeForwardInject(
       dev_temp_x_->getData(), /*ldb=*/K,
       (T)1.0,
       dev_out, /*ldc=*/d);
+  
+  if (switched) {
+    this->context_->releaseExternalStream();
+  }
 
   // Note: This does not modify W_visible; dev_out is the effective weight.
   
