@@ -20,7 +20,7 @@ import torch
 # Imports from aihwkit.
 from aihwkit.nn import AnalogLinear
 from aihwkit.optim import AnalogSGD
-from aihwkit.simulator.configs import SingleRPUConfig, LRTTTransferCompound, ConstantStepDevice
+from aihwkit.simulator.configs import SingleRPUConfig, LRTTTransferCompound, ConstantStepDevice, UnitCellRPUConfig
 from aihwkit.simulator.rpu_base import cuda
 
 # Prepare the datasets (input and expected output).
@@ -32,13 +32,20 @@ y = Tensor([[1.0, 0.5], [0.7, 0.3]])
 device = ConstantStepDevice(dw_min=0.001)
 lrtt_config = LRTTTransferCompound(
     unit_cell_devices=[device, device, device],  # fastA, fastB, visible
-    rank=2,  # Low-rank dimension
+    rank=1,  # Low-rank dimension
     transfer_every=9,  # Transfer A@B to visible every 10 updates
-    transfer_lr=0.5,  # Learning rate for transfer
+    transfer_lr=1.0,  # Learning rate for transfer
     forward_inject=True,  # Use W_eff = W_visible + α*(A@B) in forward pass
     lora_alpha=1.0,  # LoRA scaling factor
+    units_in_mbatch=False,
 )
-
+lrtt_config.transfer_every = 1         # <-- 매 스텝 transfer
+lrtt_config.units_in_mbatch = True     # <-- mbatch 단위가 아닌 sample 단위 카운트
+lrtt_config.ab_use_bl_management = False
+lrtt_config.transfer_use_bl_management = False
+lrtt_config.ab_use_update_management = False
+lrtt_config.transfer_use_update_management = False
+lrtt_config.gamma_vec= [0,0,1]
 rpu_config = SingleRPUConfig(device=lrtt_config)
 model = AnalogLinear(4, 2, bias=False, rpu_config=rpu_config)
 

@@ -59,8 +59,8 @@ MONITOR_LRTT = True  # Enable LRTT operation monitoring
 
 # LR-TT parameters
 LRTT_RANK = 8  # Low-rank dimension
-TRANSFER_EVERY = 2  # Transfer every N updates
-TRANSFER_LR = 10000  # Transfer learning rate (Note: actual transfer is limited by device dw_min)
+TRANSFER_EVERY = 100  # Transfer every N updates
+TRANSFER_LR = 1  # Transfer learning rate (Note: actual transfer is limited by device dw_min)
 
 
 def get_lrtt_weights(layer):
