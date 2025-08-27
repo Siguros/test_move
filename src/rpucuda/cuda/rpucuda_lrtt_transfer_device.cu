@@ -1205,14 +1205,9 @@ void LRTTTransferRPUDeviceCuda<T>::runUpdateKernel(
     RPU_FATAL("LRTTTransferRPUDeviceCuda requires rank > 0");
   }
   
-  // Handle fully hidden case FIRST (before sync)
-  if (this->fully_hidden_) {
-    this->dev_weights_ptrs_[idx_visible_] = dev_weights;
-    dev_w_visible_ = dev_weights;  // Ensure consistent buffer usage in transfer path
-  }
-  
-  // Fix A: One-time sync of visible tile from aggregated layer weights
-  // Must be done AFTER fully_hidden pointer update
+  // Sync visible tile from aggregated layer weights if needed
+  // The visible tile must always point to its own memory, never to the aggregated buffer
+  // We use D2D copy (syncVisibleWithAggregated) to synchronize the data
   if (!visible_synced_ || last_agg_ptr_ != dev_weights) {
     cudaStream_t stream = up_context ? up_context->getStream() : this->context_->getStream();
     syncVisibleWithAggregated(dev_weights, stream);
@@ -1288,10 +1283,10 @@ void LRTTTransferRPUDeviceCuda<T>::runUpdateKernel(
     doLoRAPulsedUpdate_(x_in, d_in, lr_scaled, m_batch, up_local, up_context);
     
     // Handle transfer scheduling
-    int transfer_every = transfer_every_;
-    if (units_in_mbatch_) {
-      transfer_every *= m_batch;
-    }
+    // Fix: When units_in_mbatch_ is true, increment counter by batch size
+    // but keep transfer_every as the threshold (in samples, not batches)
+    const int increment = units_in_mbatch_ ? m_batch : 1;
+    const int transfer_every = transfer_every_;
     
     // Check if we're at the beginning of a new transfer cycle
     if (transfer_every > 0 && transfer_counter_ == 0) {
@@ -1299,12 +1294,13 @@ void LRTTTransferRPUDeviceCuda<T>::runUpdateKernel(
       cudaStream_t transfer_stream = up_context ? up_context->getStream() : this->context_->getStream();
       reinitFastTiles(transfer_stream);
       if (getenv("AIHWKIT_DEBUG_LRTT")) {
-        printf("[LR-TT Pulsed] New cycle started: reinit A,B (transfer_every=%d)\n", transfer_every);
+        printf("[LR-TT Pulsed] New cycle started: reinit A,B (transfer_every=%d %s)\n", 
+               transfer_every, units_in_mbatch_ ? "samples" : "batches");
       }
     }
     
-    // Increment counter after update
-    transfer_counter_++;
+    // Increment counter after update (by batch size if counting samples)
+    transfer_counter_ += increment;
     
     // Check if we've reached the transfer point
     if (transfer_every > 0 && transfer_counter_ >= transfer_every) {
@@ -1314,7 +1310,8 @@ void LRTTTransferRPUDeviceCuda<T>::runUpdateKernel(
       num_transfers_++;
       transfer_counter_ = 0;  // Reset for next cycle
       if (getenv("AIHWKIT_DEBUG_LRTT")) {
-        printf("[LR-TT Pulsed] Transfer executed after %d updates\n", transfer_every);
+        printf("[LR-TT Pulsed] Transfer executed after %d %s\n", 
+               transfer_every, units_in_mbatch_ ? "samples" : "batches");
       }
     }
     
@@ -1434,9 +1431,6 @@ void LRTTTransferRPUDeviceCuda<T>::applyABOuterAsPulsedUpdate(T lr_scale, cudaSt
   // Check if devVis has appropriate parameters for transfer
   
   if (getenv("AIHWKIT_DEBUG_LRTT")) {
-    const auto& vis_par = devVis->getPar();
-    printf("[LR-TT] Visible device parameters: dw_min=%.6e, dw_min_std=%.6e\n",
-           (float)vis_par.dw_min, (float)vis_par.dw_min_std);
     printf("[LR-TT] Transfer parameters: lr_scale=%.6e (transfer_lr from config)\n",
            (float)lr_scale);
   }
@@ -1697,14 +1691,22 @@ pwukpvec_t<T> LRTTTransferRPUDeviceCuda<T>::getUpdateKernels(
   pwukpvec_t<T> v;
   
   // Calculate chunking for transfer scheduling
-  int transfer_every = transfer_every_;
-  if (units_in_mbatch_) {
-    transfer_every *= m_batch;
+  // Fix: For units_in_mbatch_, transfer_every is in samples,
+  // so we need to convert to batches for chunking calculation
+  int transfer_every_batches = transfer_every_;
+  if (units_in_mbatch_ && m_batch > 0) {
+    // Convert from samples to batches for chunking
+    transfer_every_batches = (transfer_every_ + m_batch - 1) / m_batch;
   }
   
-  int nchunks = (transfer_every > 0 && transfer_every < m_batch) ? 
-                ((m_batch + transfer_every - 1) / transfer_every) : 1;
+  int nchunks = (transfer_every_batches > 0 && transfer_every_batches < m_batch) ? 
+                ((m_batch + transfer_every_batches - 1) / transfer_every_batches) : 1;
   int chunk_size = (m_batch + nchunks - 1) / nchunks;
+  
+  if (getenv("AIHWKIT_DEBUG_LRTT")) {
+    printf("[LR-TT] getUpdateKernels: m_batch=%d, transfer_every=%d %s, chunks=%d, chunk_size=%d\n",
+           m_batch, transfer_every_, units_in_mbatch_ ? "samples" : "batches", nchunks, chunk_size);
+  }
   
   // Get kernels from fast A device
   v = this->rpucuda_device_vec_[idx_fastA_]->getUpdateKernels(
