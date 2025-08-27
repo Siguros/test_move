@@ -2476,7 +2476,10 @@ bool LRTTTransferRPUDeviceCuda<T>::forwardWithAnalogInject(
   // (2) B analog forward: g_full = B*x → pack top-K rows to g_rank
   T *saved_out = iom.getOutBuffer();
   iom.setOutBuffer(dev_fb_out_->getData());
-  fb.computeAnalogMVSinglePassPublic(dev_w_b_, iom, mv_pars, out_trans, transposed);
+  // CRITICAL FIX: Use current weight pointer from dev_weights_ptrs_, not cached dev_w_b_
+  T* current_w_b = (idx_fastB_ >= 0 && idx_fastB_ < (int)this->dev_weights_ptrs_.size())
+                   ? this->dev_weights_ptrs_[idx_fastB_] : dev_w_b_;
+  fb.computeAnalogMVSinglePassPublic(current_w_b, iom, mv_pars, out_trans, transposed);
   iom.setOutBuffer(saved_out);
 
   // g_rank = first K rows of g_full → dev_xb_mb_ [rank, mb]
@@ -2506,7 +2509,10 @@ bool LRTTTransferRPUDeviceCuda<T>::forwardWithAnalogInject(
 
   iom.setInBuffer(dev_x_pad_->getData());
   iom.setOutBuffer(dev_y_ab_->getData());
-  fb.computeAnalogMVSinglePassPublic(dev_w_a_, iom, mv_pars, out_trans, transposed);
+  // CRITICAL FIX: Use current weight pointer from dev_weights_ptrs_, not cached dev_w_a_
+  T* current_w_a = (idx_fastA_ >= 0 && idx_fastA_ < (int)this->dev_weights_ptrs_.size())
+                   ? this->dev_weights_ptrs_[idx_fastA_] : dev_w_a_;
+  fb.computeAnalogMVSinglePassPublic(current_w_a, iom, mv_pars, out_trans, transposed);
 
   // Restore IOM buffers
   iom.setInBuffer(saved_in);
@@ -2574,11 +2580,15 @@ void LRTTTransferRPUDeviceCuda<T>::copyALRTo(T* dst, cudaStream_t stream) const 
   // Critical fix: Wait for A/B reinit completion before reading
   const_cast<LRTTTransferRPUDeviceCuda<T>*>(this)->waitABReinitOn(s);
   
-  // Extract first r columns from dev_w_a_ (which is [d, x_size])
+  // CRITICAL FIX: Use current weight pointer from dev_weights_ptrs_, not cached dev_w_a_
+  T* current_w_a = (idx_fastA_ >= 0 && idx_fastA_ < (int)this->dev_weights_ptrs_.size())
+                   ? this->dev_weights_ptrs_[idx_fastA_] : dev_w_a_;
+  
+  // Extract first r columns from current_w_a (which is [d, x_size])
   // We need to pack the first r columns into a compact [d, r] matrix
   const int threads = 256;
   const int blocks = (d * r + threads - 1) / threads;
-  kernelPackFirstKCols<<<blocks, threads, 0, s>>>(dst, dev_w_a_, d, this->x_size_, r);
+  kernelPackFirstKCols<<<blocks, threads, 0, s>>>(dst, current_w_a, d, this->x_size_, r);
 }
 
 template <typename T>
@@ -2593,11 +2603,15 @@ void LRTTTransferRPUDeviceCuda<T>::copyBLRTo(T* dst, cudaStream_t stream) const 
   // Critical fix: Wait for A/B reinit completion before reading
   const_cast<LRTTTransferRPUDeviceCuda<T>*>(this)->waitABReinitOn(s);
   
-  // Extract first r rows from dev_w_b_ (which is [d_size, x])
+  // CRITICAL FIX: Use current weight pointer from dev_weights_ptrs_, not cached dev_w_b_
+  T* current_w_b = (idx_fastB_ >= 0 && idx_fastB_ < (int)this->dev_weights_ptrs_.size())
+                   ? this->dev_weights_ptrs_[idx_fastB_] : dev_w_b_;
+  
+  // Extract first r rows from current_w_b (which is [d_size, x])
   // We need to pack the first r rows into a compact [r, x] matrix
   const int threads = 256;
   const int blocks = (r * x + threads - 1) / threads;
-  kernelPackFirstKRows<<<blocks, threads, 0, s>>>(dst, dev_w_b_, this->d_size_, x, r);
+  kernelPackFirstKRows<<<blocks, threads, 0, s>>>(dst, current_w_b, this->d_size_, x, r);
 }
 
 template <typename T>

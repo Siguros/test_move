@@ -59,7 +59,7 @@ MONITOR_LRTT = True  # Enable LRTT operation monitoring
 
 # LR-TT parameters
 LRTT_RANK = 8  # Low-rank dimension
-TRANSFER_EVERY = 100  # Transfer every N updates
+TRANSFER_EVERY = 1  # Transfer every N updates
 TRANSFER_LR = 1  # Transfer learning rate (Note: actual transfer is limited by device dw_min)
 
 
@@ -106,7 +106,7 @@ def create_lrtt_config():
         rank=LRTT_RANK,
         transfer_every=TRANSFER_EVERY,
         transfer_lr=TRANSFER_LR,
-        forward_inject=True,  # Use effective weights in forward pass
+        forward_inject=False,  # Use effective weights in forward pass
         lora_alpha=8.0,
         transfer_use_bl_management=False,
         transfer_use_update_management=False

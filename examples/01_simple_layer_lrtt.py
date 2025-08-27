@@ -29,24 +29,17 @@ y = Tensor([[1.0, 0.5], [0.7, 0.3]])
 
 # Define a single-layer network using LR-TT transfer learning
 # LR-TT uses three devices: fastA, fastB for low-rank updates, and visible for accumulated weights
-device = ConstantStepDevice(dw_min=0.001)
+device = ConstantStepDevice(dw_min=0.0000001, dw_min_dtod=0.0, up_down_dtod=0.0)
 lrtt_config = LRTTTransferCompound(
     unit_cell_devices=[device, device, device],  # fastA, fastB, visible
     rank=1,  # Low-rank dimension
-    transfer_every=9,  # Transfer A@B to visible every 10 updates
-    transfer_lr=1.0,  # Learning rate for transfer
-    forward_inject=True,  # Use W_eff = W_visible + α*(A@B) in forward pass
+    transfer_every=1,  # Transfer A@B to visible every 10 updates
+    transfer_lr=0.5,  # Learning rate for transfer
+    forward_inject=False,  # Use W_eff = W_visible + α*(A@B) in forward pass
     lora_alpha=1.0,  # LoRA scaling factor
     units_in_mbatch=False,
 )
-lrtt_config.transfer_every = 1         # <-- 매 스텝 transfer
-lrtt_config.units_in_mbatch = True     # <-- mbatch 단위가 아닌 sample 단위 카운트
-lrtt_config.ab_use_bl_management = False
-lrtt_config.transfer_use_bl_management = False
-lrtt_config.ab_use_update_management = False
-lrtt_config.transfer_use_update_management = False
-lrtt_config.gamma_vec= [0,0,1]
-rpu_config = SingleRPUConfig(device=lrtt_config)
+rpu_config = UnitCellRPUConfig(device=lrtt_config)
 model = AnalogLinear(4, 2, bias=False, rpu_config=rpu_config)
 
 # Move the model and tensors to cuda if it is available.
@@ -64,7 +57,7 @@ print(f"Rank: 2, Transfer every: 10 updates")
 print("-" * 50)
 
 
-for epoch in range(100):
+for epoch in range(1000):
     # Delete old gradient
     opt.zero_grad()
     # Add the training Tensor to the model (input).
