@@ -175,16 +175,21 @@ class LRTTTransferCompound(TransferCompound):
             raise ValueError(f"transfer_desired_bl must be positive or -1 (no override) when transfer_use_bl_management=True, got {self.transfer_desired_bl}")
         
         # Handle legacy parameters for backward compatibility
-        if self.use_bl_management and not hasattr(self, '_legacy_warning_shown'):
-            import warnings
-            warnings.warn("use_bl_management is deprecated. Use ab_use_bl_management instead.", DeprecationWarning)
-            self._legacy_warning_shown = True
+        # Only override ab_* parameters if they haven't been explicitly set
+        if self.use_bl_management and self.ab_use_bl_management == True:
+            # ab_use_bl_management has default value, can override with legacy
+            if not hasattr(self, '_legacy_warning_shown'):
+                import warnings
+                warnings.warn("use_bl_management is deprecated. Use ab_use_bl_management instead.", DeprecationWarning)
+                self._legacy_warning_shown = True
             self.ab_use_bl_management = self.use_bl_management
         
-        if self.desired_bl != 1.0 and not hasattr(self, '_legacy_bl_warning_shown'):
-            import warnings
-            warnings.warn("desired_bl is deprecated. Use ab_desired_bl instead.", DeprecationWarning)
-            self._legacy_bl_warning_shown = True
+        if self.desired_bl != 1.0 and self.ab_desired_bl == -1.0:
+            # ab_desired_bl has default value (-1), can override with legacy
+            if not hasattr(self, '_legacy_bl_warning_shown'):
+                import warnings
+                warnings.warn("desired_bl is deprecated. Use ab_desired_bl instead.", DeprecationWarning)
+                self._legacy_bl_warning_shown = True
             self.ab_desired_bl = self.desired_bl
         
         # Validate transfer_every (0 allowed for inference)
@@ -192,6 +197,7 @@ class LRTTTransferCompound(TransferCompound):
             raise ValueError(f"transfer_every must be non-negative (0 for inference), got {self.transfer_every}")
         
         # Override parent transfer settings to avoid double triggers
+        # LRTT handles its own transfer logic via transfer_every
         self.n_reads_per_transfer = 0  # No read slices by parent
         
         # Set canonical indices

@@ -561,10 +561,12 @@ LRTTTransferRPUDeviceCuda<T>::LRTTTransferRPUDeviceCuda(
   
   // CRITICAL FIX: Extract all LRTT parameters from CPU device
   const auto &lrtt_cpu_par = cpu_device.getPar();
-  transfer_lr_ = lrtt_cpu_par.transfer_lr;
-  transfer_every_ = lrtt_cpu_par.transfer_every;
-  units_in_mbatch_ = lrtt_cpu_par.units_in_mbatch;
-  n_reads_per_transfer_ = lrtt_cpu_par.n_reads_per_transfer;
+  // Access transfer_lr from parent class (TransferRPUDeviceMetaParameter)
+  const auto &base_par = static_cast<const RPU::TransferRPUDeviceMetaParameter<T>&>(lrtt_cpu_par);
+  transfer_lr_ = base_par.transfer_lr;
+  transfer_every_ = (int)base_par.transfer_every;
+  units_in_mbatch_ = base_par.units_in_mbatch;
+  n_reads_per_transfer_ = base_par.n_reads_per_transfer;
   
   // BL management parameters
   ab_use_bl_management_ = lrtt_cpu_par.ab_use_bl_management;
@@ -980,10 +982,12 @@ void LRTTTransferRPUDeviceCuda<T>::populateFrom(const AbstractRPUDevice<T> &rpu_
   rank_ = cpu_device.getRank();
   
   // CRITICAL FIX: Copy all LRTT parameters
-  transfer_lr_ = lrtt_cpu_par.transfer_lr;
-  transfer_every_ = lrtt_cpu_par.transfer_every;
-  units_in_mbatch_ = lrtt_cpu_par.units_in_mbatch;
-  n_reads_per_transfer_ = lrtt_cpu_par.n_reads_per_transfer;
+  // Access transfer_lr from parent class (TransferRPUDeviceMetaParameter)
+  const auto &base_par = static_cast<const RPU::TransferRPUDeviceMetaParameter<T>&>(lrtt_cpu_par);
+  transfer_lr_ = base_par.transfer_lr;
+  transfer_every_ = (int)base_par.transfer_every;
+  units_in_mbatch_ = base_par.units_in_mbatch;
+  n_reads_per_transfer_ = base_par.n_reads_per_transfer;
   
   // BL management parameters
   ab_use_bl_management_ = lrtt_cpu_par.ab_use_bl_management;
@@ -1098,6 +1102,9 @@ void LRTTTransferRPUDeviceCuda<T>::populateFrom(const AbstractRPUDevice<T> &rpu_
       if (getenv("AIHWKIT_DEBUG_LRTT")) {
         printf("[LR-TT CUDA] Initial reinit complete in populateFrom: A=0, B~Kaiming\n");
       }
+      // CRITICAL FIX: Also schedule reinit on first update stream to avoid cross-stream race
+      // This ensures the first update step will reinit on its own stream, making it safe
+      need_reinit_ = true;
     } else {
       // Fallback: schedule lazy init if pointers not ready yet
       need_reinit_ = true;
@@ -1109,7 +1116,7 @@ void LRTTTransferRPUDeviceCuda<T>::populateFrom(const AbstractRPUDevice<T> &rpu_
 }
 
 template <typename T>
-void LRTTTransferRPUDeviceCuda<T>::ensureLazyInit() {
+void LRTTTransferRPUDeviceCuda<T>::ensureLazyInit(cudaStream_t stream) {
   if (need_reinit_ && rank_ > 0) {
     // Check if pointers are ready
     if (!dev_w_a_ || !dev_w_b_) {
@@ -1118,15 +1125,30 @@ void LRTTTransferRPUDeviceCuda<T>::ensureLazyInit() {
     
     // If pointers are now ready, perform reinit
     if (dev_w_a_ && dev_w_b_) {
-      reinitFastTiles(this->context_->getStream());
+      // CRITICAL FIX: Use the provided stream instead of context stream
+      // This ensures reinit and subsequent operations are on the same stream
+      cudaStream_t s = stream ? stream : this->context_->getStream();
+      reinitFastTiles(s);
       need_reinit_ = false;
       
       // NO SYNCHRONIZE! Let it be async for performance
       // The kernels are enqueued on the same stream, so ordering is guaranteed
       
       if (getenv("AIHWKIT_DEBUG_LRTT")) {
-        printf("[LR-TT CUDA] Lazy reinit enqueued: A=0, B~Kaiming\n");
+        printf("[LR-TT CUDA] Lazy reinit enqueued on stream %p: A=0, B~Kaiming\n", s);
       }
+    }
+  }
+}
+
+template <typename T>
+inline void LRTTTransferRPUDeviceCuda<T>::checkWeightsReadyOrDie() {
+  // Common helper to ensure all weight pointers are valid
+  if (!dev_w_visible_ || !dev_w_a_ || !dev_w_b_) {
+    initializeDevicePointers();
+    if (!dev_w_visible_ || !dev_w_a_ || !dev_w_b_) {
+      RPU_FATAL("LRTT: device weight pointers not initialized (visible=%p, A=%p, B=%p) before use.",
+                dev_w_visible_, dev_w_a_, dev_w_b_);
     }
   }
 }
@@ -1194,8 +1216,11 @@ void LRTTTransferRPUDeviceCuda<T>::runUpdateKernel(
     uint32_t *d_counts_chunk,
     const ChoppedWeightOutput<T> *cwo) {
   
-  // Ensure lazy initialization is complete
-  ensureLazyInit();
+  // Get the stream that will be used for updates
+  cudaStream_t update_stream = up_context ? up_context->getStream() : this->context_->getStream();
+  
+  // CRITICAL FIX: Ensure lazy initialization is complete on the same stream as updates
+  ensureLazyInit(update_stream);
   
   // Validate preconditions for LR-TT operation
   if (update_rule_ != LRUpdateRule::LR_TT) {
@@ -1226,6 +1251,9 @@ void LRTTTransferRPUDeviceCuda<T>::runUpdateKernel(
   // Ensure scratch buffers are allocated before use
   ensureABScratch_();
   ensurePaddedBuffers(m_batch);
+  
+  // CRITICAL: Ensure all weight pointers are valid
+  checkWeightsReadyOrDie();
   
   if (getenv("AIHWKIT_DEBUG_LRTT")) {
     printf("[LR-TT DEBUG] runUpdateKernel: pulsed path, rank=%d, m_batch=%d\n", rank_, m_batch);
@@ -1267,6 +1295,19 @@ void LRTTTransferRPUDeviceCuda<T>::runUpdateKernel(
       up_local.desired_BL = ab_desired_bl_;
     } // else keep device default
     
+    // CRITICAL FIX: Check if we're at the beginning of a new transfer cycle
+    // This MUST happen BEFORE the update to ensure A,B start from 0
+    const int transfer_every = transfer_every_;
+    if (transfer_every > 0 && transfer_counter_ == 0) {
+      // Beginning of new cycle: reinit A,B BEFORE accumulating gradients
+      cudaStream_t transfer_stream = up_context ? up_context->getStream() : this->context_->getStream();
+      reinitFastTiles(transfer_stream);
+      if (getenv("AIHWKIT_DEBUG_LRTT")) {
+        printf("[LR-TT Pulsed] New cycle started: reinit A,B BEFORE update (transfer_every=%d %s)\n", 
+               transfer_every, units_in_mbatch_ ? "samples" : "batches");
+      }
+    }
+    
     // Apply gradient magnitude correction if enabled (for pulsed path)
     T lr_scaled = lr;
     if (correct_gradient_magnitudes_ && rank_ > 0) {
@@ -1279,27 +1320,13 @@ void LRTTTransferRPUDeviceCuda<T>::runUpdateKernel(
       }
     }
     
-    // Use the pulsed LoRA update with scaled LR
+    // Use the pulsed LoRA update with scaled LR (A,B are now properly initialized)
     doLoRAPulsedUpdate_(x_in, d_in, lr_scaled, m_batch, up_local, up_context);
     
-    // Handle transfer scheduling
+    // Handle transfer counter increment
     // Fix: When units_in_mbatch_ is true, increment counter by batch size
     // but keep transfer_every as the threshold (in samples, not batches)
     const int increment = units_in_mbatch_ ? m_batch : 1;
-    const int transfer_every = transfer_every_;
-    
-    // Check if we're at the beginning of a new transfer cycle
-    if (transfer_every > 0 && transfer_counter_ == 0) {
-      // Beginning of new cycle: reinit A,B
-      cudaStream_t transfer_stream = up_context ? up_context->getStream() : this->context_->getStream();
-      reinitFastTiles(transfer_stream);
-      if (getenv("AIHWKIT_DEBUG_LRTT")) {
-        printf("[LR-TT Pulsed] New cycle started: reinit A,B (transfer_every=%d %s)\n", 
-               transfer_every, units_in_mbatch_ ? "samples" : "batches");
-      }
-    }
-    
-    // Increment counter after update (by batch size if counting samples)
     transfer_counter_ += increment;
     
     // Check if we've reached the transfer point
@@ -1788,6 +1815,14 @@ void LRTTTransferRPUDeviceCuda<T>::doLoRAUpdate(
     RPU_FATAL("LR-TT: rank must be > 0 before LoRA update."); 
   }
   
+  // CRITICAL: Verify all pointers are valid before GEMM operations
+  if (!dev_w_a_ || !dev_w_b_ || !dev_temp_d_ || !dev_temp_x_ || !dev_xa_mb_ || !dev_db_mb_) {
+    RPU_FATAL("LR-TT: NULL pointers detected before LoRA update. A=%p, B=%p, temp_d=%p, temp_x=%p",
+              dev_w_a_, dev_w_b_, 
+              dev_temp_d_ ? dev_temp_d_->getData() : nullptr,
+              dev_temp_x_ ? dev_temp_x_->getData() : nullptr);
+  }
+  
   // 1. Pack A_lr and B_lr submatrices
   // A_lr = A[:, :rank] -> [d_size, rank]
   const int threads = 256;
@@ -1806,6 +1841,13 @@ void LRTTTransferRPUDeviceCuda<T>::doLoRAUpdate(
   
   // 2. Compute LoRA projections
   // X_A = B_lr @ X -> [rank, m_batch]
+  if (getenv("AIHWKIT_DEBUG_LRTT")) {
+    printf("[LR-TT GEMM] X_A = B_lr @ X: M=%d, N=%d, K=%d, lda=%d, ldb=%d, ldc=%d\n",
+           rank_, m_batch, this->x_size_, rank_, this->x_size_, rank_);
+    printf("  B_lr ptr=%p, X ptr=%p, X_A ptr=%p\n", 
+           dev_temp_x_->getData(), x_in, dev_xa_mb_->getData());
+  }
+  CUDA_CALL(cudaPeekAtLastError());
   RPU::math::gemm<T>(
       this->context_,
       /*transA=*/false,  // B_lr is [rank, x_size] col-major
@@ -2267,8 +2309,8 @@ bool LRTTTransferRPUDeviceCuda<T>::forwardWithAnalogInject(
     const bool out_trans,
     const bool transposed) {
 
-  // Ensure lazy initialization is complete
-  ensureLazyInit();
+  // CRITICAL FIX: Ensure lazy initialization is complete on the context stream (for forward)
+  ensureLazyInit(this->context_->getStream());
 
   // Fallback: if not enabled or invalid rank, use existing visible-only path
   if (!forward_inject_ || rank_ <= 0) {

@@ -216,7 +216,8 @@ public:
 protected:
   // Initialize device pointers
   void initializeDevicePointers();
-  void ensureLazyInit();
+  inline void checkWeightsReadyOrDie();
+  void ensureLazyInit(cudaStream_t stream = nullptr);
   
   // Override parent's transfer to use AB outer product
   void transfer(

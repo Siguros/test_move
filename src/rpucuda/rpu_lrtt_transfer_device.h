@@ -56,7 +56,7 @@ struct LRTTTransferRPUDeviceMetaParameter : public TransferRPUDeviceMetaParamete
   // Transfer and update parameters
   bool correct_gradient_magnitudes = false;
   bool swap_xd = false;     // Swap X/D for update contract
-  T transfer_lr = (T)1.0;   // Learning rate for transfer
+  // transfer_lr is inherited from TransferRPUDeviceMetaParameter (no shadowing)
   
   // A/B training update BL management controls
   bool ab_use_bl_management = true;  // Enable BL management for A/B updates (default: true for backward compat)
