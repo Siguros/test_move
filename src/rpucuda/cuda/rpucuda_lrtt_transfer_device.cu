@@ -678,6 +678,7 @@ LRTTTransferRPUDeviceCuda<T>::LRTTTransferRPUDeviceCuda(
   // Create CUDA events for synchronization
   CUDA_CALL(cudaEventCreateWithFlags(&visible_sync_ev_, cudaEventDisableTiming));
   CUDA_CALL(cudaEventCreateWithFlags(&ab_reinit_ev_, cudaEventDisableTiming));
+  CUDA_CALL(cudaEventCreateWithFlags(&ab_update_ev_, cudaEventDisableTiming)); // CRITICAL FIX
   
   // Initialize reinit state
   need_reinit_ = (rank_ > 0);
@@ -694,6 +695,10 @@ LRTTTransferRPUDeviceCuda<T>::~LRTTTransferRPUDeviceCuda() {
   if (ab_reinit_ev_) {
     cudaEventDestroy(ab_reinit_ev_);
     ab_reinit_ev_ = nullptr;
+  }
+  if (ab_update_ev_) {
+    cudaEventDestroy(ab_update_ev_);
+    ab_update_ev_ = nullptr;
   }
 }
 
@@ -777,6 +782,7 @@ LRTTTransferRPUDeviceCuda<T>::LRTTTransferRPUDeviceCuda(
   // Create CUDA events for synchronization
   CUDA_CALL(cudaEventCreateWithFlags(&visible_sync_ev_, cudaEventDisableTiming));
   CUDA_CALL(cudaEventCreateWithFlags(&ab_reinit_ev_, cudaEventDisableTiming));
+  CUDA_CALL(cudaEventCreateWithFlags(&ab_update_ev_, cudaEventDisableTiming)); // CRITICAL FIX
   
   // Initialize reinit state
   need_reinit_ = (rank_ > 0);
@@ -823,6 +829,10 @@ LRTTTransferRPUDeviceCuda<T>::operator=(const LRTTTransferRPUDeviceCuda<T> &othe
       cudaEventDestroy(ab_reinit_ev_);
       ab_reinit_ev_ = nullptr;
     }
+    if (ab_update_ev_) {  // CRITICAL FIX: Also destroy ab_update_ev_
+      cudaEventDestroy(ab_update_ev_);
+      ab_update_ev_ = nullptr;
+    }
     visible_synced_ = false;     // Force re-sync on first use
     last_agg_ptr_ = nullptr;
     
@@ -866,6 +876,7 @@ LRTTTransferRPUDeviceCuda<T>::operator=(const LRTTTransferRPUDeviceCuda<T> &othe
     // Create CUDA events for synchronization (copy constructor deep copy)
     CUDA_CALL(cudaEventCreateWithFlags(&visible_sync_ev_, cudaEventDisableTiming));
     CUDA_CALL(cudaEventCreateWithFlags(&ab_reinit_ev_, cudaEventDisableTiming));
+    CUDA_CALL(cudaEventCreateWithFlags(&ab_update_ev_, cudaEventDisableTiming));  // CRITICAL FIX: Also create ab_update_ev_
     
     // Initialize reinit state
     need_reinit_ = (rank_ > 0);
@@ -926,6 +937,7 @@ LRTTTransferRPUDeviceCuda<T>::LRTTTransferRPUDeviceCuda(
       last_agg_ptr_(other.last_agg_ptr_),
       visible_sync_ev_(other.visible_sync_ev_),  // Transfer event handle
       ab_reinit_ev_(other.ab_reinit_ev_),        // Transfer event handle
+      ab_update_ev_(other.ab_update_ev_),        // CRITICAL FIX: Transfer ab_update_ev_ handle
       ab_initialized_(other.ab_initialized_),
       need_reinit_(other.need_reinit_) {
   
@@ -935,6 +947,7 @@ LRTTTransferRPUDeviceCuda<T>::LRTTTransferRPUDeviceCuda(
   other.scratch_mb_capacity_ = 0;
   other.visible_sync_ev_ = nullptr;  // Clear moved-from event
   other.ab_reinit_ev_ = nullptr;     // Clear moved-from event
+  other.ab_update_ev_ = nullptr;     // CRITICAL FIX: Clear moved-from ab_update_ev_
   other.ab_initialized_ = false;
   other.need_reinit_ = false;
 }
@@ -995,10 +1008,14 @@ LRTTTransferRPUDeviceCuda<T>::operator=(LRTTTransferRPUDeviceCuda<T> &&other) no
     if (ab_reinit_ev_) {
       cudaEventDestroy(ab_reinit_ev_);
     }
+    if (ab_update_ev_) {  // CRITICAL FIX: Also destroy existing ab_update_ev_
+      cudaEventDestroy(ab_update_ev_);
+    }
     visible_sync_ev_ = other.visible_sync_ev_;
     visible_synced_ = other.visible_synced_;
     last_agg_ptr_ = other.last_agg_ptr_;
     ab_reinit_ev_ = other.ab_reinit_ev_;
+    ab_update_ev_ = other.ab_update_ev_;  // CRITICAL FIX: Transfer ab_update_ev_ handle
     ab_initialized_ = other.ab_initialized_;
     need_reinit_ = other.need_reinit_;
     
@@ -1008,6 +1025,7 @@ LRTTTransferRPUDeviceCuda<T>::operator=(LRTTTransferRPUDeviceCuda<T> &&other) no
     other.scratch_mb_capacity_ = 0;
     other.visible_sync_ev_ = nullptr;  // Clear moved-from event
     other.ab_reinit_ev_ = nullptr;     // Clear moved-from event
+    other.ab_update_ev_ = nullptr;     // CRITICAL FIX: Clear moved-from ab_update_ev_
     other.ab_initialized_ = false;
     other.need_reinit_ = false;
   }
@@ -1431,6 +1449,11 @@ void LRTTTransferRPUDeviceCuda<T>::doTransfer(cudaStream_t stream) {
     }
   }
   
+  cudaStream_t s = stream ? stream : this->context_->getStream();
+  
+  // CRITICAL FIX: Wait for A/B update completion before transfer
+  waitABUpdateOn(s);
+  
   // Debug output
   DEBUG_OUT("LRTT doTransfer called! transfer_lr=" << transfer_lr_ << ", rank=" << rank_);
   
@@ -1636,6 +1659,15 @@ void LRTTTransferRPUDeviceCuda<T>::applyABOuterAsPulsedUpdate(T lr_scale, cudaSt
   if (cross_stream) {
     CUDA_CALL(cudaEventDestroy(ev_pack_done));
     CUDA_CALL(cudaEventDestroy(ev_update_done));
+  }
+  
+  // CRITICAL FIX: Record visible sync completion event
+  // This signals that the C tile transfer is complete
+  if (visible_sync_ev_) {
+    CUDA_CALL(cudaEventRecord(visible_sync_ev_, ctx_s));
+    if (getenv("AIHWKIT_DEBUG_LRTT")) {
+      printf("[LR-TT] Recorded visible sync event after transfer on stream %p\n", ctx_s);
+    }
   }
 }
 
@@ -2198,7 +2230,15 @@ void LRTTTransferRPUDeviceCuda<T>::doLoRAPulsedUpdate_(
     }
   }
   
-  // Restore original stream if we switched it
+  // CRITICAL FIX: Record A/B update completion event on the UPDATE stream (s), not default stream
+  if (ab_update_ev_) {
+    CUDA_CALL(cudaEventRecord(ab_update_ev_, s));
+    if (std::getenv("AIHWKIT_DEBUG_LRTT")) {
+      printf("[DEBUG] Recorded A/B update event on stream %p\n", s);
+    }
+  }
+  
+  // Restore original stream if we switched it (AFTER recording event)
   if (need_stream_switch) {
     this->context_->releaseExternalStream();
   }
@@ -2307,17 +2347,20 @@ void LRTTTransferRPUDeviceCuda<T>::composeForwardInject(
   // Use provided stream if available, otherwise use context stream
   cudaStream_t s = stream ? stream : this->context_->getStream();
   
+  // Fix A: Ensure visible weights are synced on first forward
+  if (!visible_synced_ && last_agg_ptr_) {
+    syncVisibleWithAggregated(last_agg_ptr_, s);
+    visible_synced_ = true;
+  }
+  
   // Wait for any pending visible sync from another stream
   waitVisibleSyncOn(s);
   
   // Critical fix: Wait for A/B reinit completion before reading
   waitABReinitOn(s);
   
-  // Fix A: Ensure visible weights are synced on first forward
-  if (!visible_synced_ && last_agg_ptr_) {
-    syncVisibleWithAggregated(last_agg_ptr_, s);
-    visible_synced_ = true;
-  }
+  // CRITICAL FIX: Wait for A/B update completion before reading
+  waitABUpdateOn(s);
   const int d = this->d_size_;
   const int x = this->x_size_;
   const int K = rank_;
@@ -2325,10 +2368,14 @@ void LRTTTransferRPUDeviceCuda<T>::composeForwardInject(
   // Apply LoRA alpha scaling (caller typically passes base alpha, we multiply by lora_alpha)
   T effective_alpha = alpha * lora_alpha_;
   
+  // SAFETY: Use current weight pointer from dev_weights_ptrs_, not cached dev_w_visible_
+  T* current_w_visible = (idx_visible_ >= 0 && idx_visible_ < (int)this->dev_weights_ptrs_.size())
+                        ? this->dev_weights_ptrs_[idx_visible_] : dev_w_visible_;
+  
   if (K <= 0) {
     // Just copy visible weights to out if rank==0
     CUDA_CALL(
-      cudaMemcpyAsync(dev_out, dev_w_visible_, sizeof(T) * d * x,
+      cudaMemcpyAsync(dev_out, current_w_visible, sizeof(T) * d * x,
                       cudaMemcpyDeviceToDevice, s));
     return;
   }
@@ -2349,7 +2396,7 @@ void LRTTTransferRPUDeviceCuda<T>::composeForwardInject(
 
   // 2) dev_out = W_visible
   CUDA_CALL(
-    cudaMemcpyAsync(dev_out, dev_w_visible_, sizeof(T) * d * x,
+    cudaMemcpyAsync(dev_out, current_w_visible, sizeof(T) * d * x,
                     cudaMemcpyDeviceToDevice, s));
 
   // 3) dev_out += alpha * (A_lr @ B_lr)
@@ -2403,24 +2450,61 @@ bool LRTTTransferRPUDeviceCuda<T>::forwardWithAnalogInject(
   
   // Critical fix: Wait for A/B reinit completion before reading
   waitABReinitOn(this->context_->getStream());
+  
+  // CRITICAL FIX: Wait for A/B update completion before reading
+  waitABUpdateOn(this->context_->getStream());
 
   // Fallback: if not enabled or invalid rank, use existing visible-only path
   if (!forward_inject_ || rank_ <= 0) {
-    if (std::getenv("AIHWKIT_DEBUG_LRTT")) {
-      printf("[LR-TT DEBUG] Fallback path: forward_inject=%d, rank=%d, dev_w_visible_=%p\n",
-             (int)forward_inject_, rank_, dev_w_visible_);
+    cudaStream_t s = this->context_->getStream();
+    
+    // Safety net: if not synced yet, force sync now
+    if (!visible_synced_ && last_agg_ptr_) {
+      syncVisibleWithAggregated(last_agg_ptr_, s);
+      visible_synced_ = true;
     }
-    fb.computeAnalogMVSinglePassPublic(dev_w_visible_, iom, mv_pars, out_trans, transposed);
+    
+    waitVisibleSyncOn(s);  // CRITICAL FIX: Wait for visible sync in fallback path
+    
+    // SAFETY: Use current weight pointer from dev_weights_ptrs_, not cached dev_w_visible_
+    T* current_w_visible = (idx_visible_ >= 0 && idx_visible_ < (int)this->dev_weights_ptrs_.size())
+                          ? this->dev_weights_ptrs_[idx_visible_] : dev_w_visible_;
+    
+    if (std::getenv("AIHWKIT_DEBUG_LRTT")) {
+      printf("[LR-TT DEBUG] Fallback path: forward_inject=%d, rank=%d, current_w_visible=%p\n",
+             (int)forward_inject_, rank_, current_w_visible);
+    }
+    fb.computeAnalogMVSinglePassPublic(current_w_visible, iom, mv_pars, out_trans, transposed);
     return fb.finalizeOutputPublic(out_values, iom, mv_pars, out_trans, transposed);
   }
 
-  // Current implementation requires non-transposed layouts; fall back if not satisfied
+  // PATCH 2: Handle transposed/out_trans with digital composition
   if (out_trans || transposed) {
-    RPU_WARNING(
-        "LR-TT analog forward-inject currently requires "
-        "out_trans==false and transposed==false; "
-        "falling back to visible-only path.");
-    fb.computeAnalogMVSinglePassPublic(dev_w_visible_, iom, mv_pars, out_trans, transposed);
+    // Ensure lazy init and synchronization
+    cudaStream_t s = this->context_->getStream();
+    ensureLazyInit(s);
+    waitABReinitOn(s);
+    waitABUpdateOn(s); // CRITICAL: Wait for updates
+    waitVisibleSyncOn(s); // CRITICAL: Wait for visible sync
+    
+    // Ensure visible weights are synced
+    if (!visible_synced_ && last_agg_ptr_) {
+      syncVisibleWithAggregated(last_agg_ptr_, s);
+      visible_synced_ = true;
+    }
+    
+    // Allocate W_eff buffer if needed
+    const int d = this->d_size_;
+    const int x = this->x_size_;
+    if (!dev_w_eff_ || dev_w_eff_->getSize() < d * x) {
+      dev_w_eff_ = std::make_unique<CudaArray<T>>(this->context_, d * x);
+    }
+    
+    // Compose W_eff = visible + lora_alpha * (A @ B)
+    composeForwardInject((T)1.0, dev_w_eff_->getData(), s);
+    
+    // Single analog pass with effective weights
+    fb.computeAnalogMVSinglePassPublic(dev_w_eff_->getData(), iom, mv_pars, out_trans, transposed);
     return fb.finalizeOutputPublic(out_values, iom, mv_pars, out_trans, transposed);
   }
 
@@ -2432,13 +2516,13 @@ bool LRTTTransferRPUDeviceCuda<T>::forwardWithAnalogInject(
   // Fix A: Ensure visible weights are synced on first forward
   cudaStream_t s = this->context_->getStream();
   
-  // Wait for any pending visible sync from another stream
-  waitVisibleSyncOn(s);
-  
   if (!visible_synced_ && last_agg_ptr_) {
     syncVisibleWithAggregated(last_agg_ptr_, s);
     visible_synced_ = true;
   }
+  
+  // Wait for any pending visible sync from another stream
+  waitVisibleSyncOn(s);
   
   const int mb = iom.getMBatch();
   ensurePaddedBuffers(mb);   // provides dev_x_pad_
@@ -2461,17 +2545,24 @@ bool LRTTTransferRPUDeviceCuda<T>::forwardWithAnalogInject(
   // NOTE: We intentionally use the same mv_pars for W, B, and A so all three
   // tiles share the same IO calibration (noise, offsets, NL) in this design.
   // If per-tile MV params are introduced later, plumb them here accordingly.
+  
+  // SAFETY: Use current weight pointer from dev_weights_ptrs_, not cached dev_w_visible_
+  T* current_w_visible = (idx_visible_ >= 0 && idx_visible_ < (int)this->dev_weights_ptrs_.size())
+                        ? this->dev_weights_ptrs_[idx_visible_] : dev_w_visible_;
+  
   if (std::getenv("AIHWKIT_DEBUG_LRTT")) {
-    printf("[LR-TT] About to compute visible forward with dev_w_visible_=%p\n", dev_w_visible_);
-    if (dev_w_visible_) {
+    printf("[LR-TT] About to compute visible forward with current_w_visible=%p\n", current_w_visible);
+    if (current_w_visible) {
       // Print first few weights to check if they're zero
       T weights[4];
-      cudaMemcpy(weights, dev_w_visible_, sizeof(T) * 4, cudaMemcpyDeviceToHost);
+      cudaMemcpy(weights, current_w_visible, sizeof(T) * 4, cudaMemcpyDeviceToHost);
       printf("[LR-TT] First 4 visible weights: %f, %f, %f, %f\n", 
              (float)weights[0], (float)weights[1], (float)weights[2], (float)weights[3]);
     }
   }
-  fb.computeAnalogMVSinglePassPublic(dev_w_visible_, iom, mv_pars, out_trans, transposed);
+  fb.computeAnalogMVSinglePassPublic(current_w_visible, iom, mv_pars, out_trans, transposed);
+  // CRITICAL FIX: Store visible forward result before overwriting with B forward
+  fb.finalizeOutputPublic(out_values, iom, mv_pars, out_trans, transposed);
 
   // (2) B analog forward: g_full = B*x → pack top-K rows to g_rank
   T *saved_out = iom.getOutBuffer();
@@ -2479,7 +2570,8 @@ bool LRTTTransferRPUDeviceCuda<T>::forwardWithAnalogInject(
   // CRITICAL FIX: Use current weight pointer from dev_weights_ptrs_, not cached dev_w_b_
   T* current_w_b = (idx_fastB_ >= 0 && idx_fastB_ < (int)this->dev_weights_ptrs_.size())
                    ? this->dev_weights_ptrs_[idx_fastB_] : dev_w_b_;
-  fb.computeAnalogMVSinglePassPublic(current_w_b, iom, mv_pars, out_trans, transposed);
+  // CRITICAL: B forward MUST use out_trans=false, transposed=false to ensure [d×mb] layout
+  fb.computeAnalogMVSinglePassPublic(current_w_b, iom, mv_pars, false, false);
   iom.setOutBuffer(saved_out);
 
   // g_rank = first K rows of g_full → dev_xb_mb_ [rank, mb]
@@ -2580,6 +2672,9 @@ void LRTTTransferRPUDeviceCuda<T>::copyALRTo(T* dst, cudaStream_t stream) const 
   // Critical fix: Wait for A/B reinit completion before reading
   const_cast<LRTTTransferRPUDeviceCuda<T>*>(this)->waitABReinitOn(s);
   
+  // CRITICAL FIX: Wait for A/B update completion before reading
+  const_cast<LRTTTransferRPUDeviceCuda<T>*>(this)->waitABUpdateOn(s);
+  
   // CRITICAL FIX: Use current weight pointer from dev_weights_ptrs_, not cached dev_w_a_
   T* current_w_a = (idx_fastA_ >= 0 && idx_fastA_ < (int)this->dev_weights_ptrs_.size())
                    ? this->dev_weights_ptrs_[idx_fastA_] : dev_w_a_;
@@ -2602,6 +2697,9 @@ void LRTTTransferRPUDeviceCuda<T>::copyBLRTo(T* dst, cudaStream_t stream) const 
   
   // Critical fix: Wait for A/B reinit completion before reading
   const_cast<LRTTTransferRPUDeviceCuda<T>*>(this)->waitABReinitOn(s);
+  
+  // CRITICAL FIX: Wait for A/B update completion before reading
+  const_cast<LRTTTransferRPUDeviceCuda<T>*>(this)->waitABUpdateOn(s);
   
   // CRITICAL FIX: Use current weight pointer from dev_weights_ptrs_, not cached dev_w_b_
   T* current_w_b = (idx_fastB_ >= 0 && idx_fastB_ < (int)this->dev_weights_ptrs_.size())

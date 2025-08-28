@@ -49,14 +49,14 @@ WEIGHT_PATH = os.path.join(RESULTS, "example_18_lrtt_model_weight.pth")
 # Training parameters
 SEED = 1
 N_EPOCHS = 100  # Reduced for LRTT demonstration
-BATCH_SIZE = 32
+BATCH_SIZE = 64
 LEARNING_RATE = 0.1
 N_CLASSES = 10
 
 # LR-TT specific parameters
 LRTT_RANK = 16  # Low-rank dimension for ResNet layers
-TRANSFER_EVERY = 100  # Transfer every N updates
-TRANSFER_LR = 0.5  # Transfer learning rate
+TRANSFER_EVERY = 1  # Transfer every N updates
+TRANSFER_LR = 1  # Transfer learning rate
 
 
 def create_lrtt_config():
@@ -68,8 +68,8 @@ def create_lrtt_config():
         rank=LRTT_RANK,
         transfer_every=TRANSFER_EVERY,
         transfer_lr=TRANSFER_LR,
-        forward_inject=True,  # Use effective weights W_eff = W_visible + α*(A@B)
-        lora_alpha=1.0,
+        forward_inject=False,  # Use effective weights W_eff = W_visible + α*(A@B)
+        lora_alpha=8.0,
     )
     
     # Add mapping for weight scaling

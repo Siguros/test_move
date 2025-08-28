@@ -342,6 +342,7 @@ private:
   // Temporary buffers for analog forward-inject
   std::unique_ptr<CudaArray<T>> dev_fb_out_; // B*x full result [d_size * m_batch]
   std::unique_ptr<CudaArray<T>> dev_y_ab_;   // A*(B_lr*x)    [d_size * m_batch]
+  std::unique_ptr<CudaArray<T>> dev_w_eff_;  // Effective weights for transposed path (PATCH 2)
   
   // Fix A: Track visible weight sync state
   bool visible_synced_ = false;
@@ -352,6 +353,7 @@ private:
   
   // Critical fix: Add A/B reinit synchronization
   cudaEvent_t ab_reinit_ev_ = nullptr; // A/B reinit completion signal
+  cudaEvent_t ab_update_ev_ = nullptr; // A/B update completion signal (CRITICAL FIX for sync)
   bool ab_initialized_ = false;        // Whether A/B are valid
   
 public:
@@ -372,6 +374,16 @@ public:
         printf("[DEBUG] waiting on A/B reinit event from stream %p\n", s);
       }
       CUDA_CALL(cudaStreamWaitEvent(s, ab_reinit_ev_, 0)); 
+    }
+  }
+
+  // CRITICAL FIX: Helper to wait for A/B update completion on a consumer stream
+  inline void waitABUpdateOn(cudaStream_t s) {
+    if (ab_update_ev_) {
+      if (std::getenv("AIHWKIT_DEBUG_LRTT")) {
+        printf("[DEBUG] waiting on A/B update event from stream %p\n", s);
+      }
+      CUDA_CALL(cudaStreamWaitEvent(s, ab_update_ev_, 0));
     }
   }
 };

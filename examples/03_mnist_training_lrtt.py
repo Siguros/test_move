@@ -58,9 +58,9 @@ BATCH_SIZE = 64
 MONITOR_LRTT = True  # Enable LRTT operation monitoring
 
 # LR-TT parameters
-LRTT_RANK = 8  # Low-rank dimension
-TRANSFER_EVERY = 1  # Transfer every N updates
-TRANSFER_LR = 1  # Transfer learning rate (Note: actual transfer is limited by device dw_min)
+LRTT_RANK = 16  # Low-rank dimension
+TRANSFER_EVERY = 100  # Transfer every N updates
+TRANSFER_LR = 1.0  # Transfer learning rate (Note: actual transfer is limited by device dw_min)
 
 
 def get_lrtt_weights(layer):
@@ -100,14 +100,14 @@ def load_images():
 
 def create_lrtt_config():
     """Create LR-TT configuration for analog layers."""
-    device = ConstantStepDevice(dw_min=0.001)
+    device = ConstantStepDevice(dw_min=0.00001)
     lrtt_config = LRTTTransferCompound(
         unit_cell_devices=[device, device, device],  # fastA, fastB, visible
         rank=LRTT_RANK,
         transfer_every=TRANSFER_EVERY,
         transfer_lr=TRANSFER_LR,
         forward_inject=False,  # Use effective weights in forward pass
-        lora_alpha=8.0,
+        lora_alpha=1.0,
         transfer_use_bl_management=False,
         transfer_use_update_management=False
     )
@@ -135,21 +135,21 @@ def create_analog_network_lrtt(input_size, hidden_sizes, output_size):
         AnalogLinear(
             input_size,
             hidden_sizes[0],
-            False,
+            bias=False,
             rpu_config=lrtt_config,
         ),
         nn.Sigmoid(),
         AnalogLinear(
             hidden_sizes[0],
             hidden_sizes[1],
-            False,
+            bias=False,
             rpu_config=lrtt_config,
         ),
         nn.Sigmoid(),
         AnalogLinear(
             hidden_sizes[1],
             output_size,
-            False,
+            bias=False,
             rpu_config=fp_config,  # Use FloatingPointDevice for last layer
         ),
         nn.LogSoftmax(dim=1),
@@ -228,21 +228,21 @@ def train(model, train_data, val_data=None):
                     B_norm_before = torch.norm(w_before['B']).item()
                     B_norm_after = torch.norm(w_after['B']).item()
                     
-                    if vis_change > 0.01 and A_norm_after < 0.01:
-                        print(f'\n  🔄 TRANSFER at step {global_step} in {name}:')
-                        print(f'     A: {A_norm_before:.4f} → {A_norm_after:.4f} (reset)')
-                        print(f'     B: {B_norm_before:.4f} → {B_norm_after:.4f} (reinit)')
-                        print(f'     C: Δ={vis_change:.4f} (transfer of A@B)')
+                    # if vis_change > 0.01 and A_norm_after < 0.01:
+                    #     print(f'\n  🔄 TRANSFER at step {global_step} in {name}:')
+                    #     print(f'     A: {A_norm_before:.4f} → {A_norm_after:.4f} (reset)')
+                    #     print(f'     B: {B_norm_before:.4f} → {B_norm_after:.4f} (reinit)')
+                    #     print(f'     C: Δ={vis_change:.4f} (transfer of A@B)')
                         
                         # Show actual weight values (first 2x2)
-                        if epoch == 0 and i == 0:  # Show details for first layer in first epoch
-                            print(f'\n     Weight details for {name}:')
-                            A_show = w_after['A'][:2, :2].cpu().numpy()
-                            B_show = w_after['B'][:2, :2].cpu().numpy()
-                            C_show = w_after['visible'][:2, :2].cpu().numpy()
-                            print(f'     A[0:2,0:2]: [{A_show[0,0]:.4f}, {A_show[0,1]:.4f}]')
-                            print(f'     B[0:2,0:2]: [{B_show[0,0]:.4f}, {B_show[0,1]:.4f}]')
-                            print(f'     C[0:2,0:2]: [{C_show[0,0]:.4f}, {C_show[0,1]:.4f}]')
+                        # if epoch == 0 and i == 0:  # Show details for first layer in first epoch
+                        #     print(f'\n     Weight details for {name}:')
+                        #     A_show = w_after['A'][:2, :2].cpu().numpy()
+                        #     B_show = w_after['B'][:2, :2].cpu().numpy()
+                        #     C_show = w_after['visible'][:2, :2].cpu().numpy()
+                        #     print(f'     A[0:2,0:2]: [{A_show[0,0]:.4f}, {A_show[0,1]:.4f}]')
+                        #     print(f'     B[0:2,0:2]: [{B_show[0,0]:.4f}, {B_show[0,1]:.4f}]')
+                        #     print(f'     C[0:2,0:2]: [{C_show[0,0]:.4f}, {C_show[0,1]:.4f}]')
             
             if batch_idx % 100 == 0 and batch_idx > 0:
                 print(f'  Batch {batch_idx:3d}/{len(train_data)} - Loss: {loss.item():.4f}')

@@ -32,10 +32,10 @@ y = Tensor([[1.0, 0.5], [0.7, 0.3]])
 device = ConstantStepDevice(dw_min=0.0000001, dw_min_dtod=0.0, up_down_dtod=0.0)
 lrtt_config = LRTTTransferCompound(
     unit_cell_devices=[device, device, device],  # fastA, fastB, visible
-    rank=1,  # Low-rank dimension
+    rank=2,  # Low-rank dimension
     transfer_every=1,  # Transfer A@B to visible every 10 updates
-    transfer_lr=0.5,  # Learning rate for transfer
-    forward_inject=False,  # Use W_eff = W_visible + α*(A@B) in forward pass
+    transfer_lr=1,  # Learning rate for transfer
+    forward_inject=True,  # Use W_eff = W_visible + α*(A@B) in forward pass
     lora_alpha=1.0,  # LoRA scaling factor
     units_in_mbatch=False,
 )
@@ -57,7 +57,7 @@ print(f"Rank: 2, Transfer every: 10 updates")
 print("-" * 50)
 
 
-for epoch in range(1000):
+for epoch in range(5000):
     # Delete old gradient
     opt.zero_grad()
     # Add the training Tensor to the model (input).
