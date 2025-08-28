@@ -32,7 +32,7 @@ from aihwkit.simulator.rpu_base import cuda
 
 
 # Device to use
-USE_CUDA = 0
+USE_CUDA = 1
 if cuda.is_compiled():
     USE_CUDA = 1
 DEVICE = device("cuda" if USE_CUDA else "cpu")
