@@ -1392,16 +1392,30 @@ void LRTTTransferRPUDeviceCuda<T>::runUpdateKernel(
     const int increment = units_in_mbatch_ ? m_batch : 1;
     transfer_counter_ += increment;
     
+    if (getenv("AIHWKIT_DEBUG_LRTT")) {
+      printf("[LR-TT DEBUG] Transfer counter: %d/%d (increment=%d, units_in_mbatch=%d)\n", 
+             transfer_counter_, transfer_every, increment, units_in_mbatch_);
+    }
+    
     // Check if we've reached the transfer point
     if (transfer_every > 0 && transfer_counter_ >= transfer_every) {
       // End of cycle: do transfer and reset counter
       cudaStream_t transfer_stream = up_context ? up_context->getStream() : this->context_->getStream();
+      if (getenv("AIHWKIT_DEBUG_LRTT")) {
+        printf("[LR-TT DEBUG] CALLING doTransfer! (counter=%d >= transfer_every=%d)\n", 
+               transfer_counter_, transfer_every);
+      }
       doTransfer(transfer_stream);
       num_transfers_++;
       transfer_counter_ = 0;  // Reset for next cycle
       if (getenv("AIHWKIT_DEBUG_LRTT")) {
-        printf("[LR-TT Pulsed] Transfer executed after %d %s\n", 
-               transfer_every, units_in_mbatch_ ? "samples" : "batches");
+        printf("[LR-TT Pulsed] Transfer executed after %d %s (total transfers=%d)\n", 
+               transfer_every, units_in_mbatch_ ? "samples" : "batches", num_transfers_);
+      }
+    } else {
+      if (getenv("AIHWKIT_DEBUG_LRTT")) {
+        printf("[LR-TT DEBUG] No transfer yet (counter=%d < transfer_every=%d)\n", 
+               transfer_counter_, transfer_every);
       }
     }
     
@@ -1457,10 +1471,21 @@ void LRTTTransferRPUDeviceCuda<T>::doTransfer(cudaStream_t stream) {
   // Debug output
   DEBUG_OUT("LRTT doTransfer called! transfer_lr=" << transfer_lr_ << ", rank=" << rank_);
   
+  if (getenv("AIHWKIT_DEBUG_LRTT")) {
+    printf("[LR-TT DEBUG] doTransfer: Entering transfer function (transfer_lr=%.6f, rank=%d)\n", 
+           (float)transfer_lr_, rank_);
+    printf("[LR-TT DEBUG] doTransfer: dev_w_visible_=%p, dev_w_a_=%p, dev_w_b_=%p\n", 
+           (void*)dev_w_visible_, (void*)dev_w_a_, (void*)dev_w_b_);
+  }
+  
   // Apply the outer product update using the stored transfer_lr
   // NOTE: reinit is NO LONGER called inside applyABOuterAsPulsedUpdate
   // It happens at transfer boundaries BEFORE updates accumulate
   applyABOuterAsPulsedUpdate(transfer_lr_, stream);
+  
+  if (getenv("AIHWKIT_DEBUG_LRTT")) {
+    printf("[LR-TT DEBUG] doTransfer: Transfer completed!\n");
+  }
 }
 
 
@@ -2516,13 +2541,18 @@ bool LRTTTransferRPUDeviceCuda<T>::forwardWithAnalogInject(
   // Fix A: Ensure visible weights are synced on first forward
   cudaStream_t s = this->context_->getStream();
   
+  // Ensure lazy initialization for A,B weights
+  ensureLazyInit(s);
+  
   if (!visible_synced_ && last_agg_ptr_) {
     syncVisibleWithAggregated(last_agg_ptr_, s);
     visible_synced_ = true;
   }
   
-  // Wait for any pending visible sync from another stream
-  waitVisibleSyncOn(s);
+  // Wait for synchronization events
+  waitVisibleSyncOn(s);    // Wait for visible sync from another stream
+  waitABReinitOn(s);       // Wait for A,B reinit if in progress
+  waitABUpdateOn(s);       // Wait for A,B update if in progress
   
   const int mb = iom.getMBatch();
   ensurePaddedBuffers(mb);   // provides dev_x_pad_
@@ -2560,12 +2590,20 @@ bool LRTTTransferRPUDeviceCuda<T>::forwardWithAnalogInject(
              (float)weights[0], (float)weights[1], (float)weights[2], (float)weights[3]);
     }
   }
+  // (1) Visible forward to temp buffer (WITHOUT finalize!)
+  T *saved_out = iom.getOutBuffer();
+  iom.setOutBuffer(dev_fb_out_->getData());  // Store visible result temporarily
   fb.computeAnalogMVSinglePassPublic(current_w_visible, iom, mv_pars, out_trans, transposed);
-  // CRITICAL FIX: Store visible forward result before overwriting with B forward
-  fb.finalizeOutputPublic(out_values, iom, mv_pars, out_trans, transposed);
+  // Copy visible result to final output buffer
+  RPU::math::copy<T>(this->context_, out_elems, dev_fb_out_->getData(), 1, saved_out, 1);
+  iom.setOutBuffer(saved_out);
+  
+  if (std::getenv("AIHWKIT_DEBUG_LRTT")) {
+    printf("[LR-TT] Visible forward computed and copied to output buffer (no finalize yet)\n");
+  }
 
   // (2) B analog forward: g_full = B*x → pack top-K rows to g_rank
-  T *saved_out = iom.getOutBuffer();
+  // Reuse dev_fb_out_ for B forward result
   iom.setOutBuffer(dev_fb_out_->getData());
   // CRITICAL FIX: Use current weight pointer from dev_weights_ptrs_, not cached dev_w_b_
   T* current_w_b = (idx_fastB_ >= 0 && idx_fastB_ < (int)this->dev_weights_ptrs_.size())
@@ -2597,7 +2635,6 @@ bool LRTTTransferRPUDeviceCuda<T>::forwardWithAnalogInject(
 
   // (3) A analog forward: y_ab = A * x_pad
   T *saved_in = iom.getInBuffer();
-  saved_out   = iom.getOutBuffer();
 
   iom.setInBuffer(dev_x_pad_->getData());
   iom.setOutBuffer(dev_y_ab_->getData());
@@ -2628,6 +2665,9 @@ bool LRTTTransferRPUDeviceCuda<T>::forwardWithAnalogInject(
 #endif
 
   // (4) Finalize ONCE after sum (OtoO output noise, nonlinearities, scaling, etc.)
+  if (std::getenv("AIHWKIT_DEBUG_LRTT")) {
+    printf("[LR-TT] Calling finalizeOutputPublic ONCE after combining visible + alpha*AB\n");
+  }
   return fb.finalizeOutputPublic(out_values, iom, mv_pars, out_trans, transposed);
 }
 

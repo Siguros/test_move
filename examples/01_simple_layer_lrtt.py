@@ -29,13 +29,13 @@ y = Tensor([[1.0, 0.5], [0.7, 0.3]])
 
 # Define a single-layer network using LR-TT transfer learning
 # LR-TT uses three devices: fastA, fastB for low-rank updates, and visible for accumulated weights
-device = ConstantStepDevice(dw_min=0.0000001, dw_min_dtod=0.0, up_down_dtod=0.0)
+device = ConstantStepDevice(dw_min=0.001, dw_min_dtod=0.0, up_down_dtod=0.0)
 lrtt_config = LRTTTransferCompound(
     unit_cell_devices=[device, device, device],  # fastA, fastB, visible
     rank=2,  # Low-rank dimension
     transfer_every=1,  # Transfer A@B to visible every 10 updates
-    transfer_lr=1,  # Learning rate for transfer
-    forward_inject=True,  # Use W_eff = W_visible + α*(A@B) in forward pass
+    transfer_lr=10,  # Learning rate for transfer
+    forward_inject=False,  # Use W_eff = W_visible + α*(A@B) in forward pass
     lora_alpha=1.0,  # LoRA scaling factor
     units_in_mbatch=False,
 )
