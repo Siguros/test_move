@@ -33,21 +33,22 @@ y = Tensor([[1.0, 0.5], [0.7, 0.3]])
 # 2. Use rank=1 instead of rank=2
 # 3. Reduce transfer_every from 100 to 10
 device = ConstantStepDevice(
-    dw_min=0.01,  # Increased significantly
+    dw_min=0.0001,  # Increased significantly
     dw_min_dtod=0.0, 
     up_down_dtod=0.0
 )
 
 lrtt_config = LRTTTransferCompound(
     unit_cell_devices=[device, device, device],  # fastA, fastB, visible
-    rank=1,  # Reduced from 2 to 1
-    transfer_every=10,  # Reduced from 100
-    transfer_lr=1.0,  # Keep at 1.0
-    forward_inject=True,  # Use W_eff = W_visible + α*(A@B) in forward pass
+    rank=2,  # Reduced from 2 to 1
+    transfer_every=1,  # Reduced from 100
+    transfer_lr=10,  # Keep at 1.0
+    forward_inject=False,  # Use W_eff = W_visible + α*(A@B) in forward pass
     lora_alpha=1.0,  # LoRA scaling factor
     units_in_mbatch=False,
 )
 rpu_config = UnitCellRPUConfig(device=lrtt_config)
+rpu_config.reinit_gain=0.5
 model = AnalogLinear(4, 2, bias=False, rpu_config=rpu_config)
 
 # Move the model and tensors to cuda if it is available.
@@ -57,10 +58,10 @@ if cuda.is_compiled():
     model = model.cuda()
 
 # CRITICAL: Initialize visible weights
-init_weights = torch.randn(2, 4) * 0.1
-if cuda.is_compiled():
-    init_weights = init_weights.cuda()
-model.set_weights(init_weights)
+# init_weights = torch.randn(2, 4) * 0.1
+# if cuda.is_compiled():
+#     init_weights = init_weights.cuda()
+# model.set_weights(init_weights)
 
 # Define an analog-aware optimizer, preparing it for using the layers.
 opt = AnalogSGD(model.parameters(), lr=0.5)  # Increased from 0.1 to 0.5

@@ -179,6 +179,7 @@ public:
   // Analog forward-inject entry point
   template <typename OutputIteratorT>
   bool forwardWithAnalogInject(
+      T *dev_weights,  // Add aggregated weights parameter
       OutputIteratorT out_values,
       InputOutputManager<T> &iom,
       ForwardBackwardPassIOManagedCuda<T> &fb,
@@ -234,6 +235,7 @@ protected:
   void applyABOuterAsPulsedUpdate(T lr_scale, cudaStream_t stream);
   // Digital transfer removed - only pulsed stochastic updates are used
   void reinitFastTiles(cudaStream_t stream);
+  void initializeVisibleWeights();
   
   // Get device weight pointers from child devices
   T* getVisibleWeightsDevice();
@@ -344,9 +346,14 @@ private:
   std::unique_ptr<CudaArray<T>> dev_y_ab_;   // A*(B_lr*x)    [d_size * m_batch]
   std::unique_ptr<CudaArray<T>> dev_w_eff_;  // Effective weights for transposed path (PATCH 2)
   
+  // Private accumulation buffers for proper IOM buffer management (FIX for forward_inject issue)
+  std::unique_ptr<CudaArray<T>> dev_y_vis_;  // Private buffer for visible forward [d_size * m_batch]
+  std::unique_ptr<CudaArray<T>> dev_y_tot_;  // Private buffer for total accumulation [d_size * m_batch]
+  
   // Fix A: Track visible weight sync state
   bool visible_synced_ = false;
   T* last_agg_ptr_ = nullptr;  // Last seen aggregated dev_weights buffer
+  bool initial_weights_copied_ = false;  // Track if initial weights have been copied to visible
   
   // Event for cross-stream synchronization of visible weight copies
   cudaEvent_t visible_sync_ev_ = nullptr;

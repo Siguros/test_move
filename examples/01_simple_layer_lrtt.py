@@ -33,13 +33,14 @@ device = ConstantStepDevice(dw_min=0.001, dw_min_dtod=0.0, up_down_dtod=0.0)
 lrtt_config = LRTTTransferCompound(
     unit_cell_devices=[device, device, device],  # fastA, fastB, visible
     rank=2,  # Low-rank dimension
-    transfer_every=1,  # Transfer A@B to visible every 10 updates
-    transfer_lr=10,  # Learning rate for transfer
-    forward_inject=False,  # Use W_eff = W_visible + α*(A@B) in forward pass
-    lora_alpha=1.0,  # LoRA scaling factor
+    transfer_every=100,  # Transfer A@B to visible every 10 updates
+    transfer_lr=0.01,  # Learning rate for transfer
+    forward_inject=True,  # Use W_eff = W_visible + α*(A@B) in forward pass
+    lora_alpha=0.01,  # LoRA scaling factor
     units_in_mbatch=False,
 )
 rpu_config = UnitCellRPUConfig(device=lrtt_config)
+rpu_config.reinit_gain=0.5
 model = AnalogLinear(4, 2, bias=False, rpu_config=rpu_config)
 
 # Move the model and tensors to cuda if it is available.
